@@ -34,12 +34,24 @@ struct NativeResponse {
     filename: Option<String>,
 }
 
+fn get_user_id() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
 fn get_ipc_socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(runtime_dir).join("illusion.sock")
     } else {
-        let uid = std::process::id();
-        PathBuf::from(format!("/tmp/illusion-{}.sock", uid))
+        let uid = get_user_id();
+        let run_user = PathBuf::from(format!("/run/user/{}", uid));
+        if run_user.exists() {
+            run_user.join("illusion.sock")
+        } else {
+            PathBuf::from(format!("/tmp/illusion-{}.sock", uid))
+        }
     }
 }
 
@@ -84,14 +96,29 @@ async fn try_forward_to_ipc_socket(msg: &NativeMessage) -> Result<Option<NativeR
     };
 
     let payload = serde_json::to_vec(msg)?;
+    let len_bytes = (payload.len() as u32).to_be_bytes();
+    stream.write_all(&len_bytes).await?;
     stream.write_all(&payload).await?;
+    stream.flush().await?;
 
-    let mut buf = vec![0u8; 65536];
-    let n = stream.read(&mut buf).await?;
-    if n > 0 {
-        if let Ok(resp) = serde_json::from_slice::<NativeResponse>(&buf[..n]) {
-            return Ok(Some(resp));
+    let mut resp_len_bytes = [0u8; 4];
+    stream.read_exact(&mut resp_len_bytes).await?;
+    let resp_bytes = if resp_len_bytes[0] == b'{' {
+        let mut data = resp_len_bytes.to_vec();
+        let mut rest = vec![0u8; 65536];
+        if let Ok(n) = stream.read(&mut rest).await {
+            data.extend_from_slice(&rest[..n]);
         }
+        data
+    } else {
+        let r_len = u32::from_be_bytes(resp_len_bytes) as usize;
+        let mut buf = vec![0u8; r_len];
+        stream.read_exact(&mut buf).await?;
+        buf
+    };
+
+    if let Ok(resp) = serde_json::from_slice::<NativeResponse>(&resp_bytes) {
+        return Ok(Some(resp));
     }
 
     Ok(None)
@@ -152,17 +179,47 @@ async fn main() -> Result<()> {
                     let task_id = task.id.clone();
                     state.add_task(task).await;
 
-                    // Spawn GUI if not already open with decoupled stdio so Chromium pipe never hangs
+                    // Spawn GUI if not already open with decoupled stdio and inherited desktop environment
                     let exe_path = std::env::current_exe()
                         .ok()
                         .and_then(|p| p.parent().map(|dir| dir.join("illusion")))
                         .unwrap_or_else(|| PathBuf::from("illusion"));
 
-                    let _ = Command::new(exe_path)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
+                    let mut cmd = Command::new(&exe_path);
+                    for var in [
+                        "WAYLAND_DISPLAY",
+                        "DISPLAY",
+                        "XDG_RUNTIME_DIR",
+                        "XDG_CURRENT_DESKTOP",
+                        "XDG_SESSION_TYPE",
+                        "HOME",
+                        "USER",
+                    ] {
+                        if let Ok(val) = std::env::var(var) {
+                            cmd.env(var, val);
+                        }
+                    }
+
+                    let log_dir = state.config_dir.clone();
+                    let _ = std::fs::create_dir_all(&log_dir);
+                    let log_file = log_dir.join("gui_spawn.log");
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_file)
+                    {
+                        if let Ok(file_clone) = file.try_clone() {
+                            cmd.stdout(file_clone);
+                        } else {
+                            cmd.stdout(std::process::Stdio::null());
+                        }
+                        cmd.stderr(file);
+                    } else {
+                        cmd.stdout(std::process::Stdio::null());
+                        cmd.stderr(std::process::Stdio::null());
+                    }
+                    cmd.stdin(std::process::Stdio::null());
+                    let _ = cmd.spawn();
 
                     let resp = NativeResponse {
                         status: "success".to_string(),

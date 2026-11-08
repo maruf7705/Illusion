@@ -17,26 +17,67 @@
   let targetVideoRect = null;
   let pollInterval = null;
 
+  function cleanMediaUrl(url) {
+    if (!url || typeof url !== "string") return "";
+    try {
+      const u = new URL(url);
+      u.searchParams.delete("bytestart");
+      u.searchParams.delete("byteend");
+      u.searchParams.delete("range");
+      u.searchParams.delete("rn");
+      u.searchParams.delete("alr");
+      u.searchParams.delete("sq");
+      u.searchParams.delete("segment");
+      u.searchParams.delete("frag");
+      return u.toString();
+    } catch (_) {
+      return url;
+    }
+  }
+
   function addStream(stream) {
     if (!stream || !stream.url) return;
-    const url = stream.url;
+    const url = cleanMediaUrl(stream.url);
+    stream.url = url;
+    if (stream.audioUrl) {
+      stream.audioUrl = cleanMediaUrl(stream.audioUrl);
+    }
+
     let itag = null;
     try {
       itag = new URL(url).searchParams.get("itag");
     } catch (_) {}
 
+    const quality = (stream.quality || "").toLowerCase();
+    const isAudio = (stream.mime || "").includes("audio") || quality.includes("audio");
+
     const idx = currentStreams.findIndex((s) => {
       if (s.url === url) return true;
       if (itag) {
         try {
-          return new URL(s.url).searchParams.get("itag") === itag;
+          if (new URL(s.url).searchParams.get("itag") === itag) return true;
         } catch (_) {}
+      }
+      const sIsAudio = (s.mime || "").includes("audio") || (s.quality || "").toLowerCase().includes("audio");
+      if (sIsAudio === isAudio) {
+        // Enforce IDM-grade quality tier uniqueness: only 1 entry per resolution tier per video
+        if (s.quality && stream.quality && s.quality.toLowerCase() === stream.quality.toLowerCase()) {
+          return true;
+        }
       }
       return false;
     });
 
     if (idx >= 0) {
-      currentStreams[idx] = { ...currentStreams[idx], ...stream };
+      const existing = currentStreams[idx];
+      currentStreams[idx] = {
+        ...existing,
+        ...stream,
+        url: stream.url || existing.url,
+        audioUrl: stream.audioUrl || existing.audioUrl,
+        size: Math.max(existing.size || 0, stream.size || 0),
+        quality: (stream.quality && stream.quality !== "720p HD") ? stream.quality : (existing.quality || stream.quality)
+      };
     } else {
       currentStreams.push(stream);
     }
@@ -68,16 +109,77 @@
       window.postMessage({ type: "__ILLUSION_TRIGGER_INSPECT__" }, "*");
     } catch (_) {}
 
-    if (window.__ILLUSION_DISCOVERED_STREAMS__ && Array.isArray(window.__ILLUSION_DISCOVERED_STREAMS__)) {
-      window.__ILLUSION_DISCOVERED_STREAMS__.forEach((s) => addStream(s));
-    }
+    // Check page window via Firefox Xray Vision wrappedJSObject
+    try {
+      const pageWin = window.wrappedJSObject || window;
+      const pageStreams = pageWin.__ILLUSION_DISCOVERED_STREAMS__;
+      if (pageStreams && Array.isArray(pageStreams)) {
+        pageStreams.forEach((s) => addStream(s));
+      }
+
+      // Direct read ytInitialPlayerResponse from page context
+      const pr = pageWin.ytInitialPlayerResponse;
+      if (pr && pr.streamingData) {
+        const streaming = pr.streamingData;
+        const formats = streaming.formats || [];
+        const adaptive = streaming.adaptiveFormats || [];
+
+        let bestAudio = null;
+        for (const f of adaptive) {
+          if (f.mimeType && f.mimeType.includes("audio")) {
+            let aUrl = f.url;
+            if (!aUrl && (f.signatureCipher || f.cipher)) {
+              try { aUrl = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+            }
+            if (aUrl) {
+              bestAudio = cleanMediaUrl(aUrl);
+              break;
+            }
+          }
+        }
+
+        formats.forEach((f) => {
+          let u = f.url;
+          if (!u && (f.signatureCipher || f.cipher)) {
+            try { u = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+          }
+          if (u) {
+            addStream({
+              url: cleanMediaUrl(u),
+              quality: f.qualityLabel || `${f.height || 360}p`,
+              mime: f.mimeType || "video/mp4",
+              size: parseInt(f.contentLength || "0", 10) || 0,
+              audioUrl: null
+            });
+          }
+        });
+
+        adaptive.forEach((f) => {
+          const isAudio = f.mimeType && f.mimeType.includes("audio");
+          let u = f.url;
+          if (!u && (f.signatureCipher || f.cipher)) {
+            try { u = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+          }
+          if (u) {
+            const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
+            addStream({
+              url: cleanMediaUrl(u),
+              quality: qLabel,
+              mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
+              size: parseInt(f.contentLength || "0", 10) || 0,
+              audioUrl: isAudio ? null : bestAudio
+            });
+          }
+        });
+      }
+    } catch (_) {}
 
     const videos = document.querySelectorAll("video");
     videos.forEach((v) => {
       const src = v.currentSrc || v.src;
       if (src && !src.startsWith("blob:") && !src.startsWith("data:") && src.startsWith("http")) {
         addStream({
-          url: src,
+          url: cleanMediaUrl(src),
           quality: v.videoHeight ? `${v.videoHeight}p` : "Video Stream",
           mime: src.includes(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4",
           size: 0
@@ -338,13 +440,24 @@
       dropdownMenu.classList.remove("visible");
     });
 
-    // Click toggle to show/hide dropdown
+    // Click toggle to show/hide dropdown or trigger instant download
     toggleBtn.addEventListener("click", (e) => {
       if (isDragging) return;
+      if (e.target.closest(".idm-btn-controls")) return;
       e.stopPropagation();
+
+      requestStreamsUpdate();
+
+      const isBadgeClick = e.target.id === "illusion-stream-count";
+
+      // If user clicked the main button (not badge) and we only have 1 stream, download immediately!
+      if (!isBadgeClick && currentStreams.length === 1 && !isDropdownOpen) {
+        triggerDownload(currentStreams[0]);
+        return;
+      }
+
       isDropdownOpen = !isDropdownOpen;
       if (isDropdownOpen) {
-        requestStreamsUpdate();
         renderStreamList();
         dropdownMenu.classList.add("visible");
       } else {
@@ -444,6 +557,17 @@
       emptyRow.style.color = "#777";
       emptyRow.style.fontStyle = "italic";
       emptyRow.innerText = "1. Finding media streams (Buffering...)";
+      emptyRow.addEventListener("click", (e) => {
+        e.stopPropagation();
+        requestStreamsUpdate();
+        if (currentStreams.length > 0) {
+          triggerDownload(currentStreams[0]);
+          isDropdownOpen = false;
+          dropdownMenu.classList.remove("visible");
+        } else {
+          showFeedback("Buffering video...");
+        }
+      });
       listContainer.appendChild(emptyRow);
 
       if (!pollInterval && isDropdownOpen) {
@@ -546,13 +670,13 @@
     return `${index + 1}. ${format} file, quality ${quality}${sizeStr}`;
   }
 
-  function showFeedback(text) {
+  function showFeedback(text, isError = false) {
     if (!barContainer) return;
     const titleEl = barContainer.querySelector(".idm-title-text");
     if (!titleEl) return;
     const origText = titleEl.innerText;
     titleEl.innerText = text;
-    titleEl.style.color = "#1ba829";
+    titleEl.style.color = isError ? "#e06c75" : "#1ba829";
     setTimeout(() => {
       if (titleEl) {
         titleEl.innerText = origText;
@@ -582,41 +706,52 @@
 
     let dispatched = false;
 
-    // 1. Try Extension Runtime Message Bus
+    // 1. Primary Channel: Extension Background Service (enriches with Cookies & Header Ring Buffer)
     if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
       try {
-        chrome.runtime.sendMessage({
-          type: "START_VIDEO_DOWNLOAD",
-          url: stream.url,
-          filename: filename,
-          audio_url: stream.audioUrl || null,
-          page_url: window.location.href,
-          quality: stream.quality || ""
-        }, () => {
-          if (!chrome.runtime.lastError) {
-            dispatched = true;
-          }
+        const res = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({
+            type: "START_VIDEO_DOWNLOAD",
+            url: stream.url,
+            filename: filename,
+            audio_url: stream.audioUrl || null,
+            page_url: window.location.href,
+            quality: stream.quality || ""
+          }, (response) => {
+            if (chrome.runtime.lastError || (response && response.status === "error")) {
+              resolve(false);
+            } else {
+              resolve(true);
+            }
+          });
         });
-        dispatched = true;
+        if (res) {
+          dispatched = true;
+        }
       } catch (e) {
         console.warn("[Illusion] Extension runtime message failed:", e);
       }
     }
 
-    // 2. Direct HTTP Bridge Fallback (127.0.0.1:9095)
-    // Ensures download triggers even if extension was reloaded or context was invalidated!
-    try {
-      const resp = await fetch("http://127.0.0.1:9095/add_download", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      if (resp.ok) {
-        dispatched = true;
-      }
-    } catch (_) {}
+    // 2. Secondary Channel: Direct HTTP Bridge Fallback (only if runtime disconnected)
+    if (!dispatched) {
+      try {
+        const resp = await fetch("http://127.0.0.1:9095/add_download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (resp.ok) {
+          dispatched = true;
+        }
+      } catch (_) {}
+    }
 
-    showFeedback("✓ Queued to Illusion!");
+    if (dispatched) {
+      showFeedback("✓ Queued to Illusion!", false);
+    } else {
+      showFeedback("✕ Connection Failed — Launch Illusion", true);
+    }
   }
 
   function positionOverVideo(rect) {

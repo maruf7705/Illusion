@@ -80,7 +80,7 @@ impl IllusionApp {
         let resume_all_flag = Arc::new(AtomicBool::new(false));
 
         // Spawn StatusNotifierItem Tray for Waybar / Hyprland
-        tray::spawn_tray(rt.clone(), pause_all_flag.clone(), resume_all_flag.clone());
+        // tray::spawn_tray(rt.clone(), pause_all_flag.clone(), resume_all_flag.clone());
 
         // Spawn Unix Domain Socket & Local HTTP Bridge IPC Daemon
         let (ipc_tx, ipc_rx) = mpsc::unbounded_channel::<String>();
@@ -106,6 +106,26 @@ impl IllusionApp {
             resume_all_flag,
             ipc_rx,
         };
+
+        // Reconcile tasks on launch (IDM-grade recovery):
+        // 1. Any task left in Downloading state without an active worker from a previous session is set to Paused
+        {
+            let mut list = app.state.tasks.write().unwrap();
+            let mut changed = false;
+            for t in list.iter_mut() {
+                if t.status == TaskStatus::Downloading {
+                    t.status = TaskStatus::Paused;
+                    t.speed = 0.0;
+                    changed = true;
+                }
+            }
+            if changed {
+                let state_clone = app.state.clone();
+                app.tokio_rt.spawn(async move {
+                    let _ = state_clone.save_tasks().await;
+                });
+            }
+        }
 
         // Auto-resume Queued tasks on launch
         let queued_tasks = {
@@ -465,8 +485,14 @@ impl eframe::App for IllusionApp {
 
         // 5. Add URL / Multiline Batch Download Modal
         if self.dialog.show_add_url {
-            let mut close = false;
-            let mut start_now = false;
+            #[derive(PartialEq)]
+            enum ModalAction {
+                None,
+                DownloadNow,
+                QueueLater,
+                Cancel,
+            }
+            let mut action = ModalAction::None;
 
             egui::Window::new("Add Download / Batch Queue")
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -548,19 +574,18 @@ impl eframe::App for IllusionApp {
 
                         if ui.button(egui::RichText::new(btn_text).strong()).clicked() {
                             if !urls.is_empty() {
-                                start_now = true;
-                                close = true;
+                                action = ModalAction::DownloadNow;
                             }
                         }
 
                         if ui.button("Queue for Later").clicked() {
                             if !urls.is_empty() {
-                                close = true;
+                                action = ModalAction::QueueLater;
                             }
                         }
 
                         if ui.button("Cancel").clicked() {
-                            close = true;
+                            action = ModalAction::Cancel;
                         }
                     });
                 });
@@ -573,9 +598,10 @@ impl eframe::App for IllusionApp {
                 .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
                 .collect();
 
-            if start_now || (close && !urls.is_empty()) {
+            if action == ModalAction::DownloadNow || action == ModalAction::QueueLater {
                 let save_dir = self.dialog.input_save_dir.clone();
                 let custom_name = self.dialog.input_filename.trim().to_string();
+                let start_now = action == ModalAction::DownloadNow;
 
                 for (idx, url) in urls.into_iter().enumerate() {
                     let mut filename = if idx == 0 && !custom_name.is_empty() {
@@ -598,7 +624,7 @@ impl eframe::App for IllusionApp {
 
                     let task_id = task.id.clone();
                     let state = self.state.clone();
-                    self.tokio_rt.block_on(async {
+                    self.tokio_rt.spawn(async move {
                         state.add_task(task).await;
                     });
 
@@ -606,9 +632,8 @@ impl eframe::App for IllusionApp {
                         self.start_download(task_id);
                     }
                 }
-            }
-
-            if close {
+                self.dialog.show_add_url = false;
+            } else if action == ModalAction::Cancel {
                 self.dialog.show_add_url = false;
             }
         }

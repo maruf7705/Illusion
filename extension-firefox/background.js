@@ -208,15 +208,18 @@ async function handleMediaResponse(tabId, details) {
   const isYouTubePlayback = url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback");
 
   let targetDownloadUrl = url;
-  if (isYouTubePlayback) {
-    try {
-      const u = new URL(url);
-      u.searchParams.delete("range");
-      u.searchParams.delete("rn");
-      u.searchParams.delete("alr");
-      targetDownloadUrl = u.toString();
-    } catch (_) {}
-  }
+  try {
+    const u = new URL(url);
+    u.searchParams.delete("bytestart");
+    u.searchParams.delete("byteend");
+    u.searchParams.delete("range");
+    u.searchParams.delete("rn");
+    u.searchParams.delete("alr");
+    u.searchParams.delete("sq");
+    u.searchParams.delete("segment");
+    u.searchParams.delete("frag");
+    targetDownloadUrl = u.toString();
+  } catch (_) {}
 
   const isMediaMime =
     contentType.startsWith("video/") ||
@@ -248,8 +251,26 @@ async function handleMediaResponse(tabId, details) {
 
   if (isYouTubePlayback || isMediaMime || isMediaExt) {
     const streams = await getTabStreams(tabId);
-    if (!streams.some((s) => s.url === targetDownloadUrl)) {
-      const quality = inferQuality(url, contentType, contentLength);
+    const quality = inferQuality(url, contentType, contentLength);
+    const isAudio = contentType.startsWith("audio/") || quality.toLowerCase().includes("audio");
+
+    const existingIdx = streams.findIndex((s) => {
+      if (s.url === targetDownloadUrl) return true;
+      const sIsAudio = (s.mime || "").includes("audio") || (s.quality || "").toLowerCase().includes("audio");
+      if (sIsAudio === isAudio && s.quality && quality && s.quality.toLowerCase() === quality.toLowerCase()) {
+        return true;
+      }
+      return false;
+    });
+
+    if (existingIdx >= 0) {
+      streams[existingIdx] = {
+        ...streams[existingIdx],
+        url: targetDownloadUrl,
+        size: Math.max(streams[existingIdx].size || 0, contentLength || 0)
+      };
+      await saveTabStreams(tabId, streams);
+    } else {
       const item = {
         url: targetDownloadUrl,
         mime: contentType || (isYouTubePlayback ? "video/mp4" : "application/octet-stream"),
@@ -584,13 +605,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === "PING_HOST") {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { action: "ping" }, (res) => {
-      if (chrome.runtime.lastError) {
-        sendResponse({ connected: false, error: chrome.runtime.lastError.message });
-      } else {
-        sendResponse({ connected: true, data: res });
-      }
-    });
+    (async () => {
+      // 1. Check primary IDM-grade HTTP Bridge (127.0.0.1:9095)
+      try {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 800);
+        const resp = await fetch("http://127.0.0.1:9095/ping", { signal: controller.signal });
+        clearTimeout(tid);
+        if (resp.ok) {
+          const json = await resp.json();
+          sendResponse({ connected: true, method: "http", data: json });
+          return;
+        }
+      } catch (_) {}
+
+      // 2. Fallback check for Native Messaging Host
+      chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { action: "ping" }, (res) => {
+        if (chrome.runtime.lastError || !res) {
+          sendResponse({ connected: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "No response" });
+        } else {
+          sendResponse({ connected: true, method: "native", data: res });
+        }
+      });
+    })();
     return true;
   }
 });

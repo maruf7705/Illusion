@@ -13,13 +13,15 @@
     if (!url || typeof url !== "string") return "";
     try {
       const u = new URL(url);
-      if (u.hostname.includes("googlevideo.com")) {
-        u.searchParams.delete("range");
-        u.searchParams.delete("rn");
-        u.searchParams.delete("alr");
-        u.searchParams.delete("sq");
-        return u.toString();
-      }
+      u.searchParams.delete("bytestart");
+      u.searchParams.delete("byteend");
+      u.searchParams.delete("range");
+      u.searchParams.delete("rn");
+      u.searchParams.delete("alr");
+      u.searchParams.delete("sq");
+      u.searchParams.delete("segment");
+      u.searchParams.delete("frag");
+      return u.toString();
     } catch (_) {}
     return url;
   }
@@ -73,6 +75,23 @@
             mime: info.m,
             audioUrl: isAudio ? null : lastActiveAudioUrl
           });
+
+          // Upgrade existing stream URLs with the live deciphered URL
+          if (window.__ILLUSION_DISCOVERED_STREAMS__) {
+            window.__ILLUSION_DISCOVERED_STREAMS__.forEach((s) => {
+              if (s && s.url) {
+                try {
+                  const sItag = new URL(s.url).searchParams.get("itag");
+                  if (sItag === itag) {
+                    s.url = cleaned;
+                  }
+                  if (isAudio && !s.audioUrl && (s.mime || "").includes("video")) {
+                    s.audioUrl = cleaned;
+                  }
+                } catch (_) {}
+              }
+            });
+          }
 
           // If audio arrived, update existing video streams that were missing audio
           if (isAudio && window.__ILLUSION_DISCOVERED_STREAMS__) {
@@ -265,20 +284,46 @@
       const adaptive = streaming.adaptiveFormats || [];
       const activeUrl = overrideUrl || lastActivePlaybackUrl;
 
+      function extractFormatUrl(f) {
+        if (!f) return null;
+        if (f.url) return f.url;
+        const cipher = f.signatureCipher || f.cipher;
+        if (cipher) {
+          try {
+            const p = new URLSearchParams(cipher);
+            const rawUrl = p.get("url");
+            if (rawUrl) {
+              const sig = p.get("s");
+              const sp = p.get("sp") || "sig";
+              if (sig) {
+                return `${rawUrl}&${sp}=${encodeURIComponent(sig)}`;
+              }
+              return rawUrl;
+            }
+          } catch (_) {}
+        }
+        return null;
+      }
+
       // Find best audio URL from live intercepted requests or direct format URLs
       let bestAudioUrl = lastActiveAudioUrl || liveItagUrls.get("140") || liveItagUrls.get("251");
       if (!bestAudioUrl) {
         for (const fmt of adaptive) {
-          if (fmt.mimeType && fmt.mimeType.includes("audio") && fmt.url) {
-            bestAudioUrl = cleanUrl(fmt.url);
-            break;
+          if (fmt.mimeType && fmt.mimeType.includes("audio")) {
+            const u = liveItagUrls.get(fmt.itag?.toString()) || extractFormatUrl(fmt);
+            if (u) {
+              bestAudioUrl = cleanUrl(u);
+              break;
+            }
           }
         }
       }
 
+      const isYouTube = window.location.hostname.includes("youtube.com");
+
       // 1. Process regular muxed formats (e.g. 360p, 720p with combined audio)
       formats.forEach((f) => {
-        let streamUrl = f.url || liveItagUrls.get(f.itag?.toString());
+        let streamUrl = liveItagUrls.get(f.itag?.toString()) || extractFormatUrl(f);
         if (streamUrl) {
           emitMediaDiscovery({
             url: cleanUrl(streamUrl),
@@ -293,7 +338,7 @@
       // 2. Process adaptive video & audio formats
       adaptive.forEach((f) => {
         const isAudio = f.mimeType && f.mimeType.includes("audio");
-        let streamUrl = f.url || liveItagUrls.get(f.itag?.toString());
+        let streamUrl = liveItagUrls.get(f.itag?.toString()) || extractFormatUrl(f);
         if (!streamUrl && activeUrl) {
           try {
             const u = new URL(activeUrl);
@@ -337,29 +382,47 @@
           });
         }
 
-        // Facebook & Instagram React Fiber traversal
+        // Facebook & Instagram React Fiber traversal (checks video and parent containers)
         if (isFB || isIG) {
-          for (const key of Object.keys(v)) {
-            if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")) {
-              let fiber = v[key];
-              let depth = 0;
-              while (fiber && depth < 25) {
-                const props = fiber.memoizedProps;
-                if (props) {
-                  const meta = props.coreVideoPlayerMetaData || props.videoFBID || props.videoData;
-                  const src = props.playbackUrl || props.hd_src || props.sd_src || (meta && (meta.playbackUrl || meta.hd_src || meta.sd_src));
-                  if (src && typeof src === "string" && src.startsWith("http")) {
-                    emitMediaDiscovery({
-                      url: src,
-                      quality: (props.hd_src || (meta && meta.hd_src)) ? "HD 1080p" : "SD 720p",
-                      mime: src.includes(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4"
-                    });
+          let curr = v;
+          let elemDepth = 0;
+          while (curr && elemDepth < 6) {
+            for (const key of Object.keys(curr)) {
+              if (key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$") || key.startsWith("__reactProps$")) {
+                let fiber = curr[key];
+                let depth = 0;
+                while (fiber && depth < 25) {
+                  const props = fiber.memoizedProps;
+                  if (props) {
+                    const meta = props.coreVideoPlayerMetaData || props.videoFBID || props.videoData;
+                    if (props.hd_src && typeof props.hd_src === "string") {
+                      emitMediaDiscovery({ url: props.hd_src, quality: "1080p HD", mime: "video/mp4" });
+                    }
+                    if (props.sd_src && typeof props.sd_src === "string") {
+                      emitMediaDiscovery({ url: props.sd_src, quality: "720p HD", mime: "video/mp4" });
+                    }
+                    if (meta && meta.hd_src && typeof meta.hd_src === "string") {
+                      emitMediaDiscovery({ url: meta.hd_src, quality: "1080p HD", mime: "video/mp4" });
+                    }
+                    if (meta && meta.sd_src && typeof meta.sd_src === "string") {
+                      emitMediaDiscovery({ url: meta.sd_src, quality: "720p HD", mime: "video/mp4" });
+                    }
+                    const src = props.playbackUrl || (meta && meta.playbackUrl);
+                    if (src && typeof src === "string" && src.startsWith("http")) {
+                      emitMediaDiscovery({
+                        url: src,
+                        quality: (props.hd_src || (meta && meta.hd_src)) ? "1080p HD" : "720p HD",
+                        mime: src.includes(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4"
+                      });
+                    }
                   }
+                  fiber = fiber.return;
+                  depth++;
                 }
-                fiber = fiber.return;
-                depth++;
               }
             }
+            curr = curr.parentElement;
+            elemDepth++;
           }
         }
       });

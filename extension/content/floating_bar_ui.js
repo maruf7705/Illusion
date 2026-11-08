@@ -444,13 +444,13 @@
     return `${index + 1}. ${format} file, quality ${quality}${sizeStr}`;
   }
 
-  function showFeedback(text) {
+  function showFeedback(text, isError = false) {
     if (!barContainer) return;
     const titleEl = barContainer.querySelector(".idm-title-text");
     if (!titleEl) return;
     const origText = titleEl.innerText;
     titleEl.innerText = text;
-    titleEl.style.color = "#1ba829";
+    titleEl.style.color = isError ? "#e06c75" : "#1ba829";
     setTimeout(() => {
       if (titleEl) {
         titleEl.innerText = origText;
@@ -480,41 +480,52 @@
 
     let dispatched = false;
 
-    // 1. Try Extension Runtime Message Bus
+    // 1. Try Extension Runtime Message Bus first
     if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
       try {
-        chrome.runtime.sendMessage({
-          type: "START_VIDEO_DOWNLOAD",
-          url: stream.url,
-          filename: filename,
-          audio_url: stream.audioUrl || null,
-          page_url: window.location.href,
-          quality: stream.quality || ""
-        }, () => {
-          if (!chrome.runtime.lastError) {
-            dispatched = true;
-          }
+        const res = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({
+            type: "START_VIDEO_DOWNLOAD",
+            url: stream.url,
+            filename: filename,
+            audio_url: stream.audioUrl || null,
+            page_url: window.location.href,
+            quality: stream.quality || ""
+          }, (response) => {
+            if (chrome.runtime.lastError || (response && response.status === "error")) {
+              resolve(false);
+            } else {
+              resolve(true);
+            }
+          });
         });
-        dispatched = true;
+        if (res) {
+          dispatched = true;
+        }
       } catch (e) {
         console.warn("[Illusion] Extension runtime message failed:", e);
       }
     }
 
-    // 2. Direct HTTP Bridge Fallback (127.0.0.1:9095)
-    // Ensures download triggers even if extension was reloaded or context was invalidated!
-    try {
-      const resp = await fetch("http://127.0.0.1:9095/add_download", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      if (resp.ok) {
-        dispatched = true;
-      }
-    } catch (_) {}
+    // 2. Direct HTTP Bridge Fallback (127.0.0.1:9095) only if extension bus was not connected
+    if (!dispatched) {
+      try {
+        const resp = await fetch("http://127.0.0.1:9095/add_download", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        if (resp.ok) {
+          dispatched = true;
+        }
+      } catch (_) {}
+    }
 
-    showFeedback("✓ Queued to Illusion!");
+    if (dispatched) {
+      showFeedback("✓ Queued to Illusion!", false);
+    } else {
+      showFeedback("✕ Connection Failed — Launch Illusion", true);
+    }
   }
 
   function positionOverVideo(rect) {

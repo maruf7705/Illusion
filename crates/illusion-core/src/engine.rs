@@ -108,43 +108,55 @@ impl DownloadEngine {
 
         // Multi-Engine Classification: Check if stream requires Dual-Stream Adaptive Muxing or HLS
         let mode = crate::stream_engine::StreamEngine::classify_task(&task);
-        match mode {
+        let stream_res = match mode {
             crate::stream_engine::StreamDispatchMode::SeparatedVideoAudioMux => {
-                return crate::stream_engine::StreamEngine::download_dual_stream(
+                Some(crate::stream_engine::StreamEngine::download_dual_stream(
                     &self.client,
                     &task_id,
                     &task,
-                    state,
+                    state.clone(),
                     &mut cancel_rx,
                 )
-                .await;
+                .await)
             }
             crate::stream_engine::StreamDispatchMode::HlsDashSegmented => {
-                return crate::stream_engine::StreamEngine::download_hls(
+                Some(crate::stream_engine::StreamEngine::download_hls(
                     &self.client,
                     &task_id,
                     &task,
-                    state,
+                    state.clone(),
                     &mut cancel_rx,
                 )
-                .await;
+                .await)
             }
-            crate::stream_engine::StreamDispatchMode::DirectByteRange => {}
+            crate::stream_engine::StreamDispatchMode::DirectByteRange => None,
+        };
+
+        if let Some(res) = stream_res {
+            if let Err(e) = res {
+                {
+                    let mut list = state.tasks.write().unwrap();
+                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                        t.status = TaskStatus::Error;
+                        t.error_message = Some(e.to_string());
+                        t.speed = 0.0;
+                    }
+                }
+                let _ = state.save_tasks().await;
+                return Err(e);
+            }
+            return Ok(());
         }
 
-        // Probe if total size or range capability unknown
-        let remote_info = probe_url(
-            &self.client,
-            &task.url,
-            Some(&task.headers),
-            Some(&task.filename),
-        )
-        .await
-        .map_err(|e| {
-            let msg = format!("Probe failed: {:#}", e);
-            error!("{}", msg);
-            msg
-        });
+        // Probe if total size or range capability unknown (with responsive cancellation support)
+        let remote_info = tokio::select! {
+            _ = cancel_rx.changed() => {
+                return Err(anyhow!("Cancelled"));
+            }
+            res = probe_url(&self.client, &task.url, Some(&task.headers), Some(&task.filename)) => {
+                res.map_err(|e| format!("Probe failed: {:#}", e))
+            }
+        };
 
         let (total_size, accept_ranges) = match remote_info {
             Ok(info) => {
@@ -657,9 +669,9 @@ async fn run_segment_worker(
         }
 
         let resp = match client.get(&url).headers(req_headers).send().await {
-            Ok(r) if r.status().is_success() => r,
+            Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT || (current == 0 && r.status() == reqwest::StatusCode::OK) => r,
             Ok(r) => {
-                warn!("Segment {} HTTP status {}", seg_id, r.status());
+                warn!("Segment {} HTTP status {} unexpected for range request", seg_id, r.status());
                 sleep(Duration::from_millis(500)).await;
                 continue;
             }

@@ -576,13 +576,29 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.type === "PING_HOST") {
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { action: "ping" }, (res) => {
-      if (chrome.runtime.lastError) {
-        sendResponse({ connected: false, error: chrome.runtime.lastError.message });
-      } else {
-        sendResponse({ connected: true, data: res });
-      }
-    });
+    (async () => {
+      // 1. Check primary IDM-grade HTTP Bridge (127.0.0.1:9095)
+      try {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), 800);
+        const resp = await fetch("http://127.0.0.1:9095/ping", { signal: controller.signal });
+        clearTimeout(tid);
+        if (resp.ok) {
+          const json = await resp.json();
+          sendResponse({ connected: true, method: "http", data: json });
+          return;
+        }
+      } catch (_) {}
+
+      // 2. Fallback check for Native Messaging Host
+      chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, { action: "ping" }, (res) => {
+        if (chrome.runtime.lastError || !res) {
+          sendResponse({ connected: false, error: (chrome.runtime.lastError && chrome.runtime.lastError.message) || "No response" });
+        } else {
+          sendResponse({ connected: true, method: "native", data: res });
+        }
+      });
+    })();
     return true;
   }
 });

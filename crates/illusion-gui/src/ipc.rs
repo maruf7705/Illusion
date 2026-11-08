@@ -37,13 +37,63 @@ pub struct IpcResponse {
     pub filename: Option<String>,
 }
 
+fn get_user_id() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    unsafe { getuid() }
+}
+
 pub fn get_ipc_socket_path() -> PathBuf {
     if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
         PathBuf::from(runtime_dir).join("illusion.sock")
     } else {
-        let uid = std::process::id();
-        PathBuf::from(format!("/tmp/illusion-{}.sock", uid))
+        let uid = get_user_id();
+        let run_user = PathBuf::from(format!("/run/user/{}", uid));
+        if run_user.exists() {
+            run_user.join("illusion.sock")
+        } else {
+            PathBuf::from(format!("/tmp/illusion-{}.sock", uid))
+        }
     }
+}
+
+pub async fn read_ipc_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    let mut len_bytes = [0u8; 4];
+    match reader.read_exact(&mut len_bytes).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+
+    // Support both length-prefixed frames AND raw JSON fallback (if starts with '{' / 0x7b)
+    if len_bytes[0] == b'{' {
+        let mut data = len_bytes.to_vec();
+        let mut rest = vec![0u8; 65536];
+        if let Ok(n) = reader.read(&mut rest).await {
+            data.extend_from_slice(&rest[..n]);
+        }
+        return Ok(Some(data));
+    }
+
+    let len = u32::from_be_bytes(len_bytes) as usize;
+    if len > 10 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC message exceeds 10MB limit",
+        ));
+    }
+    let mut buf = vec![0u8; len];
+    reader.read_exact(&mut buf).await?;
+    Ok(Some(buf))
+}
+
+pub async fn write_ipc_message<W: AsyncWriteExt + Unpin>(writer: &mut W, data: &[u8]) -> std::io::Result<()> {
+    let len = (data.len() as u32).to_be_bytes();
+    writer.write_all(&len).await?;
+    writer.write_all(data).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 pub fn start_ipc_server(
@@ -80,10 +130,9 @@ pub fn start_ipc_server(
                     let ctx = ctx_unix.clone();
 
                     tokio::spawn(async move {
-                        let mut buf = vec![0u8; 65536];
-                        match stream.read(&mut buf).await {
-                            Ok(n) if n > 0 => {
-                                if let Ok(req) = serde_json::from_slice::<IpcDownloadRequest>(&buf[..n]) {
+                        match read_ipc_message(&mut stream).await {
+                            Ok(Some(buf)) => {
+                                if let Ok(req) = serde_json::from_slice::<IpcDownloadRequest>(&buf) {
                                     if req.action == "ping" {
                                         let resp = IpcResponse {
                                             status: "pong".to_string(),
@@ -92,7 +141,7 @@ pub fn start_ipc_server(
                                             filename: None,
                                         };
                                         let res_bytes = serde_json::to_vec(&resp).unwrap_or_default();
-                                        let _ = stream.write_all(&res_bytes).await;
+                                        let _ = write_ipc_message(&mut stream, &res_bytes).await;
                                         return;
                                     }
 
@@ -124,8 +173,10 @@ pub fn start_ipc_server(
                                         let task_id = task.id.clone();
                                         state.add_task(task).await;
 
-                                        // Notify GUI to auto-start and wake up egui event loop immediately!
+                                        // Notify GUI to auto-start, bring window forward, and repaint immediately!
                                         let _ = notifier.send(task_id.clone());
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                                         ctx.request_repaint();
 
                                         let resp = IpcResponse {
@@ -135,7 +186,7 @@ pub fn start_ipc_server(
                                             filename: Some(filename),
                                         };
                                         let res_bytes = serde_json::to_vec(&resp).unwrap_or_default();
-                                        let _ = stream.write_all(&res_bytes).await;
+                                        let _ = write_ipc_message(&mut stream, &res_bytes).await;
                                     }
                                 }
                             }
@@ -315,8 +366,10 @@ async fn handle_http_client(
                 let task_id = task.id.clone();
                 state.add_task(task).await;
 
-                // Notify GUI & trigger instant repaint
+                // Notify GUI & trigger instant repaint and viewport focus
                 let _ = notifier.send(task_id.clone());
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 ctx.request_repaint();
 
                 let resp_payload = IpcResponse {

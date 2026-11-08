@@ -282,15 +282,24 @@ impl StreamEngine {
         info!("HLS Playlist contains {} media segments", total_segments);
 
         let ts_temp_path = task.save_path.with_extension("hls_tmp.ts");
-        let mut out_file = tokio::fs::File::create(&ts_temp_path).await?;
+        let mut out_file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&ts_temp_path)
+            .await?;
 
-        let mut downloaded_bytes: u64 = 0;
+        let mut downloaded_bytes: u64 = tokio::fs::metadata(&ts_temp_path)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         let mut last_instant = Instant::now();
-        let mut last_bytes: u64 = 0;
+        let mut last_bytes: u64 = downloaded_bytes;
 
         for seg_url in &segment_urls {
             if *cancel_rx.borrow() {
-                let _ = tokio::fs::remove_file(&ts_temp_path).await;
+                let _ = out_file.flush().await;
+                // Preserve downloaded TS chunks on Pause - do NOT remove!
                 return Err(anyhow!("Cancelled"));
             }
 
@@ -371,11 +380,23 @@ async fn download_single_track(
     client: reqwest::Client,
     url: String,
     save_path: PathBuf,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     mut cancel_rx: watch::Receiver<bool>,
     progress_tx: tokio::sync::mpsc::Sender<(bool, u64, Option<u64>)>,
     is_video: bool,
 ) -> Result<u64> {
+    // Check existing bytes for resumption (IDM-grade stream recovery)
+    let existing_len = tokio::fs::metadata(&save_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    if existing_len > 0 {
+        if let Ok(range_val) = reqwest::header::HeaderValue::from_str(&format!("bytes={}-", existing_len)) {
+            headers.insert(reqwest::header::RANGE, range_val);
+        }
+    }
+
     let mut resp = client
         .get(&url)
         .headers(headers)
@@ -383,27 +404,48 @@ async fn download_single_track(
         .await
         .map_err(|e| anyhow!("Stream HTTP request failed: {}", e))?;
 
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(anyhow!(
             "Stream HTTP request returned error status: {}",
-            resp.status()
+            status
         ));
     }
 
-    let content_len = resp.content_length();
-    let _ = progress_tx.send((is_video, 0, content_len)).await;
+    let is_resume_ok = existing_len > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
+    let mut downloaded = if is_resume_ok { existing_len } else { 0 };
 
-    let mut file = tokio::fs::File::create(&save_path)
-        .await
-        .map_err(|e| anyhow!("Failed to create part file {:?}: {}", save_path, e))?;
+    let total_len = if let Some(cl) = resp.content_length() {
+        if is_resume_ok {
+            Some(existing_len + cl)
+        } else {
+            Some(cl)
+        }
+    } else {
+        None
+    };
+    let _ = progress_tx.send((is_video, downloaded, total_len)).await;
 
-    let mut downloaded = 0u64;
+    let mut file = if is_resume_ok {
+        tokio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .open(&save_path)
+            .await
+            .map_err(|e| anyhow!("Failed to open part file {:?} for append: {}", save_path, e))?
+    } else {
+        tokio::fs::File::create(&save_path)
+            .await
+            .map_err(|e| anyhow!("Failed to create part file {:?}: {}", save_path, e))?
+    };
 
     loop {
         tokio::select! {
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
-                    let _ = tokio::fs::remove_file(&save_path).await;
+                    let _ = file.flush().await;
+                    // Preserve partial part file on Pause - DO NOT DELETE!
                     return Err(anyhow!("Stream download cancelled by user"));
                 }
             }
@@ -417,7 +459,8 @@ async fn download_single_track(
                     }
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = tokio::fs::remove_file(&save_path).await;
+                        let _ = file.flush().await;
+                        // Preserve partial bytes on network drop
                         return Err(anyhow!("Error reading stream chunk: {}", e));
                     }
                 }

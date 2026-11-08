@@ -62,7 +62,6 @@ pub async fn probe_url(
         head_req.send().await.ok()
     };
 
-    let mut is_head_ok = false;
     let mut total_size: Option<u64> = None;
     let mut accept_ranges = false;
     let mut etag = None;
@@ -72,7 +71,6 @@ pub async fn probe_url(
 
     if let Some(ref r) = resp {
         if r.status().is_success() {
-            is_head_ok = true;
             let headers = r.headers();
 
             if let Some(cl) = headers.get(CONTENT_LENGTH) {
@@ -113,8 +111,20 @@ pub async fn probe_url(
         }
     }
 
-    // If HEAD failed or gave no content-length, probe with Range GET bytes=0-0
-    if !is_head_ok || total_size.is_none() {
+    // Check for clen in query parameters (common in streaming media like YouTube/GoogleVideo)
+    for (k, v) in parsed_url.query_pairs() {
+        if k == "clen" {
+            if let Ok(s) = v.parse::<u64>() {
+                total_size = Some(s);
+                accept_ranges = true;
+            }
+            break;
+        }
+    }
+
+    // If HEAD failed or gave no content-length, and total_size is still unknown, probe with Range GET bytes=0-0
+    // (If total_size is already known via clen or HEAD, skip GET bytes=0-0 to avoid 403 Forbidden from CDNs)
+    if total_size.is_none() {
         let mut probe_headers = custom_headers.clone();
         probe_headers.insert(RANGE, HeaderValue::from_static("bytes=0-0"));
 
@@ -123,10 +133,14 @@ pub async fn probe_url(
         let headers = get_resp.headers();
 
         if !status.is_success() && status.as_u16() != 206 {
-            return Err(anyhow::anyhow!("Remote server returned HTTP status {}", status));
-        }
-
-        if status.as_u16() == 206 {
+            if status.as_u16() == 403 && is_googlevideo {
+                // Google Video CDN returns 403 Forbidden on bytes=0-0 if tokens are strict;
+                // Treat as streamable with ranges enabled
+                accept_ranges = true;
+            } else {
+                return Err(anyhow::anyhow!("Remote server returned HTTP status {}", status));
+            }
+        } else if status.as_u16() == 206 {
             accept_ranges = true;
             // Parse Content-Range: bytes 0-0/123456
             if let Some(cr) = headers.get("content-range") {
@@ -230,5 +244,26 @@ pub fn sanitize_filename(name: &str) -> String {
         "download".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sanitize_filename() {
+        assert_eq!(sanitize_filename("valid_name.mp4"), "valid_name.mp4");
+        assert_eq!(sanitize_filename("invalid/name:test*?.mp4"), "invalid_name_test__.mp4");
+        assert_eq!(sanitize_filename("   "), "download");
+    }
+
+    #[test]
+    fn test_content_disposition_filename() {
+        let cd = "attachment; filename=\"video_sample.mp4\"";
+        assert_eq!(parse_content_disposition_filename(cd), Some("video_sample.mp4".to_string()));
+
+        let cd_utf8 = "attachment; filename*=UTF-8''my%20song.mp3";
+        assert_eq!(parse_content_disposition_filename(cd_utf8), Some("my song.mp3".to_string()));
     }
 }
