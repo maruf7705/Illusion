@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "Illusion Download Integration",
+  "version": "1.0.0",
+  "description": "High-performance IDM integration with native multi-segment acceleration and media sniffer for Arch Linux & Hyprland.",
+  "permissions": [
+    "downloads",
+    "nativeMessaging",
+    "contextMenus",
+    "storage",
+    "cookies",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["sniffer.js", "content.js"],
+      "css": ["sniffer.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Illusion Downloader"
+  },
+  "icons": {
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

@@ -1,0 +1,546 @@
+use crate::prober::probe_url;
+use crate::segment::{Segment, SegmentStatus};
+use crate::state::AppState;
+use crate::storage::DiskStorage;
+use crate::task::TaskStatus;
+use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE, USER_AGENT};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch, Mutex};
+use tokio::time::sleep;
+use tracing::{error, info, warn};
+
+#[derive(Clone)]
+pub struct DownloadEngine {
+    client: reqwest::Client,
+    max_connections: usize,
+}
+
+impl DownloadEngine {
+    pub fn new(max_connections: usize) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(32)
+            .build()
+            .unwrap_or_default();
+
+        Self {
+            client,
+            max_connections: max_connections.clamp(1, 32),
+        }
+    }
+
+    pub async fn run_task(
+        &self,
+        task_id: String,
+        state: AppState,
+        mut cancel_rx: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let task = {
+            let list = state.tasks.read().await;
+            list.iter().find(|t| t.id == task_id).cloned()
+        }
+        .ok_or_else(|| anyhow!("Task {} not found", task_id))?;
+
+        info!("Starting download for task: {} ({})", task.filename, task.url);
+
+        // Update task status to Downloading
+        {
+            let mut list = state.tasks.write().await;
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.status = TaskStatus::Downloading;
+                t.error_message = None;
+            }
+        }
+
+        // Probe if total size or range capability unknown
+        let remote_info = probe_url(
+            &self.client,
+            &task.url,
+            Some(&task.headers),
+            Some(&task.filename),
+        )
+        .await
+        .map_err(|e| {
+            let msg = format!("Probe failed: {:#}", e);
+            error!("{}", msg);
+            msg
+        });
+
+        let (total_size, accept_ranges) = match remote_info {
+            Ok(info) => {
+                let mut list = state.tasks.write().await;
+                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                    if t.total_size.is_none() {
+                        t.total_size = info.total_size;
+                    }
+                    if t.filename.is_empty() || t.filename == "download" {
+                        t.filename = info.filename.clone();
+                    }
+                }
+                (info.total_size, info.accept_ranges)
+            }
+            Err(e) => {
+                let mut list = state.tasks.write().await;
+                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                    t.status = TaskStatus::Error;
+                    t.error_message = Some(e.clone());
+                }
+                let _ = state.save_tasks().await;
+                return Err(anyhow!(e));
+            }
+        };
+
+        // Initialize Disk Storage
+        let storage = DiskStorage::create_or_open(&task.save_path, total_size).await?;
+
+        let res = if accept_ranges && total_size.is_some() && total_size.unwrap() > 0 {
+            self.download_multisegment(
+                &task_id,
+                &task.url,
+                total_size.unwrap(),
+                &task.headers,
+                task.cookies.as_deref(),
+                task.user_agent.as_deref(),
+                storage.clone(),
+                state.clone(),
+                &mut cancel_rx,
+            )
+            .await
+        } else {
+            self.download_single_stream(
+                &task_id,
+                &task.url,
+                &task.headers,
+                task.cookies.as_deref(),
+                task.user_agent.as_deref(),
+                storage.clone(),
+                state.clone(),
+                &mut cancel_rx,
+            )
+            .await
+        };
+
+        match res {
+            Ok(_) => {
+                let mut list = state.tasks.write().await;
+                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                    t.status = TaskStatus::Completed;
+                    t.speed = 0.0;
+                    t.eta_seconds = None;
+                    t.completed_at = Some(chrono::Utc::now());
+                    if let Some(sz) = t.total_size {
+                        t.downloaded_size = sz;
+                    }
+                }
+                drop(list);
+                let _ = state.save_tasks().await;
+                let _ = storage.sync_all().await;
+                info!("Task {} finished successfully!", task.filename);
+
+                // Send desktop notification
+                #[cfg(target_os = "linux")]
+                let _ = std::process::Command::new("notify-send")
+                    .arg("⚡ Illusion Download Complete")
+                    .arg(format!("{} has finished downloading.", task.filename))
+                    .spawn();
+            }
+            Err(e) => {
+                let is_cancelled = *cancel_rx.borrow();
+                let mut list = state.tasks.write().await;
+                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                    if is_cancelled {
+                        t.status = TaskStatus::Paused;
+                        t.speed = 0.0;
+                        t.eta_seconds = None;
+                        info!("Task {} paused by user.", task.filename);
+                    } else {
+                        t.status = TaskStatus::Error;
+                        t.error_message = Some(e.to_string());
+                        t.speed = 0.0;
+                        t.eta_seconds = None;
+                        error!("Task {} failed: {:#}", task.filename, e);
+                    }
+                }
+                drop(list);
+                let _ = state.save_tasks().await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn download_multisegment(
+        &self,
+        task_id: &str,
+        url: &str,
+        total_size: u64,
+        headers_map: &HashMap<String, String>,
+        cookies: Option<&str>,
+        user_agent: Option<&str>,
+        storage: DiskStorage,
+        state: AppState,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let conn_count = self.max_connections;
+
+        // Initialize segments if not present
+        {
+            let mut list = state.tasks.write().await;
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                if t.segments.is_empty() {
+                    let chunk_size = total_size / conn_count as u64;
+                    let mut segs = Vec::new();
+                    for i in 0..conn_count {
+                        let start = i as u64 * chunk_size;
+                        let end = if i == conn_count - 1 {
+                            total_size - 1
+                        } else {
+                            (i as u64 + 1) * chunk_size - 1
+                        };
+                        segs.push(Segment::new(i, start, end));
+                    }
+                    t.segments = segs;
+                }
+            }
+        }
+
+        let segments_mutex = Arc::new(Mutex::new({
+            let list = state.tasks.read().await;
+            list.iter()
+                .find(|t| t.id == task_id)
+                .map(|t| t.segments.clone())
+                .unwrap_or_default()
+        }));
+
+        let total_downloaded = Arc::new(AtomicU64::new({
+            let list = state.tasks.read().await;
+            list.iter().find(|t| t.id == task_id).map(|t| t.downloaded_size).unwrap_or(0)
+        }));
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(conn_count * 2);
+
+        // Spawn segment download workers
+        let segs_snapshot = {
+            let l = segments_mutex.lock().await;
+            l.clone()
+        };
+
+        for seg in segs_snapshot {
+            if seg.is_finished() {
+                continue;
+            }
+
+            let client = self.client.clone();
+            let url = url.to_string();
+            let storage = storage.clone();
+            let segs_ref = segments_mutex.clone();
+            let total_dl = total_downloaded.clone();
+            let stop = stop_flag.clone();
+            let done_tx = done_tx.clone();
+            let headers_map = headers_map.clone();
+            let cookies = cookies.map(|s| s.to_string());
+            let user_agent = user_agent.map(|s| s.to_string());
+            let seg_id = seg.id;
+
+            tokio::spawn(async move {
+                let _ = run_segment_worker(
+                    client,
+                    url,
+                    seg_id,
+                    segs_ref,
+                    storage,
+                    total_dl,
+                    stop,
+                    headers_map,
+                    cookies,
+                    user_agent,
+                )
+                .await;
+                let _ = done_tx.send(()).await;
+            });
+        }
+
+        // Monitoring and dynamic rebalancing loop
+        let mut last_instant = Instant::now();
+        let mut last_bytes = total_downloaded.load(Ordering::Relaxed);
+
+        loop {
+            tokio::select! {
+                _ = sleep(Duration::from_millis(500)) => {
+                    if *cancel_rx.borrow() {
+                        stop_flag.store(true, Ordering::Relaxed);
+                        return Err(anyhow!("Cancelled"));
+                    }
+
+                    let now = Instant::now();
+                    let elapsed = now.duration_since(last_instant).as_secs_f64();
+                    let current_bytes = total_downloaded.load(Ordering::Relaxed);
+                    let delta = current_bytes.saturating_sub(last_bytes);
+                    let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+
+                    last_instant = now;
+                    last_bytes = current_bytes;
+
+                    let remaining = total_size.saturating_sub(current_bytes);
+                    let eta = if speed > 1024.0 { Some((remaining as f64 / speed) as u64) } else { None };
+
+                    // Update task in state
+                    {
+                        let segs = {
+                            let l = segments_mutex.lock().await;
+                            l.clone()
+                        };
+                        let mut list = state.tasks.write().await;
+                        if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                            t.downloaded_size = current_bytes;
+                            t.speed = speed;
+                            t.eta_seconds = eta;
+                            t.segments = segs;
+                        }
+                    }
+
+                    // Check if complete
+                    if current_bytes >= total_size {
+                        break;
+                    }
+                }
+                _ = done_rx.recv() => {
+                    // An active worker finished. Try dynamic chunk rebalancing (IDM core mechanism!)
+                    let mut segs = segments_mutex.lock().await;
+                    let next_id = segs.len();
+
+                    // Find an active segment with the largest remaining bytes (>= 2MB)
+                    let mut best_idx = None;
+                    let mut max_remaining = 2_000_000; // 2MB min threshold
+
+                    for (idx, s) in segs.iter().enumerate() {
+                        if s.status == SegmentStatus::Downloading {
+                            let rem = s.remaining_bytes();
+                            if rem > max_remaining {
+                                max_remaining = rem;
+                                best_idx = Some(idx);
+                            }
+                        }
+                    }
+
+                    if let Some(idx) = best_idx {
+                        if let Some(new_seg) = segs[idx].split_remaining(next_id, 1_000_000) {
+                            info!("Dynamic IDM rebalance: Split segment {} into new segment {}", idx, next_id);
+                            segs.push(new_seg.clone());
+                            drop(segs);
+
+                            // Launch worker for the newly split segment
+                            let client = self.client.clone();
+                            let url = url.to_string();
+                            let storage = storage.clone();
+                            let segs_ref = segments_mutex.clone();
+                            let total_dl = total_downloaded.clone();
+                            let stop = stop_flag.clone();
+                            let done_tx = done_tx.clone();
+                            let headers_map = headers_map.clone();
+                            let cookies = cookies.map(|s| s.to_string());
+                            let user_agent = user_agent.map(|s| s.to_string());
+
+                            tokio::spawn(async move {
+                                let _ = run_segment_worker(
+                                    client,
+                                    url,
+                                    new_seg.id,
+                                    segs_ref,
+                                    storage,
+                                    total_dl,
+                                    stop,
+                                    headers_map,
+                                    cookies,
+                                    user_agent,
+                                )
+                                .await;
+                                let _ = done_tx.send(()).await;
+                            });
+                        }
+                    } else {
+                        // Check if all finished
+                        let all_done = segs.iter().all(|s| s.is_finished());
+                        if all_done {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn download_single_stream(
+        &self,
+        task_id: &str,
+        url: &str,
+        headers_map: &HashMap<String, String>,
+        cookies: Option<&str>,
+        user_agent: Option<&str>,
+        storage: DiskStorage,
+        state: AppState,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        let mut headers = HeaderMap::new();
+        for (k, v) in headers_map {
+            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
+                headers.insert(name, val);
+            }
+        }
+        if let Some(ua) = user_agent {
+            if let Ok(val) = HeaderValue::from_str(ua) {
+                headers.insert(USER_AGENT, val);
+            }
+        }
+        if let Some(c) = cookies {
+            if let Ok(val) = HeaderValue::from_str(c) {
+                headers.insert("cookie", val);
+            }
+        }
+
+        let mut resp = self.client.get(url).headers(headers).send().await?;
+        let mut downloaded: u64 = 0;
+        let mut last_instant = Instant::now();
+        let mut last_bytes: u64 = 0;
+
+        while let Some(chunk_res) = resp.chunk().await? {
+            if *cancel_rx.borrow() {
+                return Err(anyhow!("Cancelled"));
+            }
+
+            let len = chunk_res.len() as u64;
+            storage.write_at(downloaded, chunk_res.to_vec()).await?;
+            downloaded += len;
+
+            let now = Instant::now();
+            let elapsed = now.duration_since(last_instant).as_secs_f64();
+            if elapsed >= 0.5 {
+                let delta = downloaded.saturating_sub(last_bytes);
+                let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                last_instant = now;
+                last_bytes = downloaded;
+
+                let mut list = state.tasks.write().await;
+                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                    t.downloaded_size = downloaded;
+                    t.speed = speed;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+async fn run_segment_worker(
+    client: reqwest::Client,
+    url: String,
+    seg_id: usize,
+    segs: Arc<Mutex<Vec<Segment>>>,
+    storage: DiskStorage,
+    total_dl: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    headers_map: HashMap<String, String>,
+    cookies: Option<String>,
+    user_agent: Option<String>,
+) -> Result<()> {
+    // Mark segment as downloading
+    let (mut current, mut end) = {
+        let mut list = segs.lock().await;
+        if let Some(s) = list.iter_mut().find(|s| s.id == seg_id) {
+            s.status = SegmentStatus::Downloading;
+            (s.current, s.end)
+        } else {
+            return Ok(());
+        }
+    };
+
+    while current <= end && !stop.load(Ordering::Relaxed) {
+        let range_str = format!("bytes={}-{}", current, end);
+        let mut req_headers = HeaderMap::new();
+        req_headers.insert(RANGE, HeaderValue::from_str(&range_str)?);
+
+        for (k, v) in &headers_map {
+            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
+                req_headers.insert(name, val);
+            }
+        }
+        if let Some(ref ua) = user_agent {
+            if let Ok(val) = HeaderValue::from_str(ua) {
+                req_headers.insert(USER_AGENT, val);
+            }
+        }
+        if let Some(ref c) = cookies {
+            if let Ok(val) = HeaderValue::from_str(c) {
+                req_headers.insert("cookie", val);
+            }
+        }
+
+        let resp = match client.get(&url).headers(req_headers).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                warn!("Segment {} HTTP status {}", seg_id, r.status());
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(e) => {
+                warn!("Segment {} request error: {:#}", seg_id, e);
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        let mut stream = resp.bytes_stream();
+        while let Some(item) = stream.next().await {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Segment {} chunk read error: {:#}", seg_id, e);
+                    break;
+                }
+            };
+
+            let len = chunk.len() as u64;
+            storage.write_at(current, chunk.to_vec()).await?;
+            current += len;
+            total_dl.fetch_add(len, Ordering::Relaxed);
+
+            // Update segment current pointer and get possibly updated end
+            {
+                let mut list = segs.lock().await;
+                if let Some(s) = list.iter_mut().find(|s| s.id == seg_id) {
+                    s.current = current;
+                    end = s.end; // Dynamic split might have shrunk end!
+                }
+            }
+
+            if current > end {
+                break;
+            }
+        }
+    }
+
+    // Mark completed or pending
+    let mut list = segs.lock().await;
+    if let Some(s) = list.iter_mut().find(|s| s.id == seg_id) {
+        if s.is_finished() {
+            s.status = SegmentStatus::Completed;
+        } else {
+            s.status = SegmentStatus::Pending;
+        }
+    }
+
+    Ok(())
+}

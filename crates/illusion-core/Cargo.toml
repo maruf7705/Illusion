@@ -21,3 +21,4 @@ hex = { workspace = true }
 nix = { workspace = true }
 directories = { workspace = true }
 uuid = { workspace = true }
+urlencoding = { workspace = true }

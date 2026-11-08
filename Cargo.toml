@@ -32,6 +32,7 @@ hex = "0.4"
 nix = { version = "0.29", features = ["fs"] }
 directories = "5.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
+urlencoding = "2.1"
 eframe = "0.29"
 rfd = "0.15"
 open = "5.3"
