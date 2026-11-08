@@ -54,7 +54,29 @@ MOZILLA_HOST_DIR="$HOME/.mozilla/native-messaging-hosts"
 
 mkdir -p "$CHROME_HOST_DIR" "$CHROMIUM_HOST_DIR" "$MOZILLA_HOST_DIR"
 
-# Chrome/Chromium manifest
+# Chrome/Chromium manifest (Chromium requires EXACT extension IDs with trailing slashes, NO wildcards!)
+EXT_ID="jfnhbpdihmchildojijlbjlldbenpdhh"
+
+# Try detecting dynamic ID from Chromium / Chrome Preferences if present
+DETECTED_ID=$(python3 -c '
+import json, os
+for p in ["'$HOME'/.config/chromium/Default/Preferences", "'$HOME'/.config/google-chrome/Default/Preferences"]:
+    if os.path.exists(p):
+        try:
+            with open(p) as f:
+                d = json.load(f)
+            for k, v in d.get("extensions", {}).get("settings", {}).items():
+                if "illusion" in str(v.get("path", "")).lower() or "illusion" in str(v.get("manifest", {}).get("name", "")).lower():
+                    print(k)
+                    break
+        except Exception:
+            pass
+' 2>/dev/null | head -n 1)
+
+if [ -n "$DETECTED_ID" ]; then
+    EXT_ID="$DETECTED_ID"
+fi
+
 cat <<EOF > "$CHROMIUM_HOST_DIR/com.illusion.downloader.json"
 {
   "name": "com.illusion.downloader",
@@ -62,8 +84,8 @@ cat <<EOF > "$CHROMIUM_HOST_DIR/com.illusion.downloader.json"
   "path": "$BIN_DIR/illusion-native-host",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://*",
-    "moz-extension://*"
+    "chrome-extension://${EXT_ID}/",
+    "chrome-extension://jfnhbpdihmchildojijlbjlldbenpdhh/"
   ]
 }
 EOF

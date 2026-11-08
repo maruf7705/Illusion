@@ -327,20 +327,27 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
 
     if (shouldIntercept) {
       try {
-        chrome.downloads.cancel(downloadItem.id, () => {
-          chrome.downloads.erase({ id: downloadItem.id });
-        });
+        // IDM Pattern: Pause first, probe Illusion, only cancel if Illusion accepted!
+        chrome.downloads.pause(downloadItem.id, async () => {
+          const ringData = getFromRingBuffer(downloadItem.url) || {};
 
-        // Correlate with rolling ring buffer headers
-        const ringData = getFromRingBuffer(downloadItem.url) || {};
+          const result = await sendToIllusion({
+            url: downloadItem.url,
+            filename: downloadItem.filename,
+            referer: downloadItem.referrer || ringData.referer || "",
+            file_size: downloadItem.fileSize || 0,
+            mime_type: downloadItem.mime || "",
+            headers: ringData.headers || {}
+          });
 
-        await sendToIllusion({
-          url: downloadItem.url,
-          filename: downloadItem.filename,
-          referer: downloadItem.referrer || ringData.referer || "",
-          file_size: downloadItem.fileSize || 0,
-          mime_type: downloadItem.mime || "",
-          headers: ringData.headers || {}
+          if (result && result.success) {
+            chrome.downloads.cancel(downloadItem.id, () => {
+              chrome.downloads.erase({ id: downloadItem.id });
+            });
+          } else {
+            console.warn("[Illusion] Illusion not available, resuming browser download");
+            chrome.downloads.resume(downloadItem.id);
+          }
         });
       } catch (err) {
         console.error("[Illusion] Failed to intercept download:", err);
@@ -354,7 +361,9 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   return true;
 });
 
-// 6. Native Messaging Communication Bridge
+// 6. Dual-Channel IDM Communication Bridge (HTTP Loopback + Native Messaging)
+const HTTP_BRIDGE_URL = "http://127.0.0.1:9095/add_download";
+
 async function sendToIllusion(details) {
   try {
     let cookiesStr = "";
@@ -379,15 +388,42 @@ async function sendToIllusion(details) {
       headers: mergedHeaders
     };
 
-    chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, payload, (response) => {
-      if (chrome.runtime.lastError) {
-        console.warn("[Illusion] Native host error:", chrome.runtime.lastError.message);
-      } else {
-        console.log("[Illusion] Native host response:", response);
+    // 1. Primary Channel: IDM-Grade Local HTTP Loopback Bridge (127.0.0.1:9095)
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 1200);
+      const httpResp = await fetch(HTTP_BRIDGE_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+
+      if (httpResp.ok) {
+        const jsonResp = await httpResp.json();
+        console.log("[Illusion] HTTP Bridge download queued:", jsonResp);
+        return { success: true, method: "http", data: jsonResp };
       }
+    } catch (httpErr) {
+      console.warn("[Illusion] HTTP Bridge unavailable, falling back to Native Messaging:", httpErr);
+    }
+
+    // 2. Secondary Channel: Native Messaging Fallback
+    return new Promise((resolve) => {
+      chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, payload, (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn("[Illusion] Native host error:", chrome.runtime.lastError.message);
+          resolve({ success: false, error: chrome.runtime.lastError.message });
+        } else {
+          console.log("[Illusion] Native host response:", response);
+          resolve({ success: true, method: "native", data: response });
+        }
+      });
     });
   } catch (e) {
-    console.error("[Illusion] Failed to forward to native host:", e);
+    console.error("[Illusion] Failed to forward to Illusion:", e);
+    return { success: false, error: e.toString() };
   }
 }
 

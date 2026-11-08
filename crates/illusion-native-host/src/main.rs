@@ -145,8 +145,12 @@ async fn main() -> Result<()> {
                     let task_id = task.id.clone();
                     state.add_task(task).await;
 
-                    // Spawn GUI if not already open
-                    let _ = Command::new("illusion").spawn();
+                    // Spawn GUI if not already open with decoupled stdio so Chromium pipe never hangs
+                    let _ = Command::new("illusion")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
 
                     let resp = NativeResponse {
                         status: "success".to_string(),
