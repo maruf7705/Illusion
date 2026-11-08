@@ -15,8 +15,42 @@ const DEFAULT_SETTINGS = {
   ]
 };
 
-// In-memory stream cache per tab
+// In-memory stream cache per tab with chrome.storage.session persistence
 const tabStreams = new Map();
+
+async function saveTabStreams(tabId, streams) {
+  tabStreams.set(tabId, streams);
+  if (chrome.storage && chrome.storage.session) {
+    try {
+      await chrome.storage.session.set({ [`tab_${tabId}`]: streams });
+    } catch (_) {}
+  }
+}
+
+async function getTabStreams(tabId) {
+  if (tabStreams.has(tabId)) {
+    return tabStreams.get(tabId);
+  }
+  if (chrome.storage && chrome.storage.session) {
+    try {
+      const res = await chrome.storage.session.get(`tab_${tabId}`);
+      if (res && res[`tab_${tabId}`]) {
+        tabStreams.set(tabId, res[`tab_${tabId}`]);
+        return res[`tab_${tabId}`];
+      }
+    } catch (_) {}
+  }
+  return [];
+}
+
+async function removeTabStreams(tabId) {
+  tabStreams.delete(tabId);
+  if (chrome.storage && chrome.storage.session) {
+    try {
+      await chrome.storage.session.remove(`tab_${tabId}`);
+    } catch (_) {}
+  }
+}
 
 // Helper to infer quality or stream type
 function inferQuality(url, mime, sizeBytes) {
