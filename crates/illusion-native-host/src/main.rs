@@ -3,9 +3,12 @@ use illusion_core::{AppState, DownloadTask};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::Command;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct NativeMessage {
     action: String,
     url: Option<String>,
@@ -16,12 +19,21 @@ struct NativeMessage {
     headers: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct NativeResponse {
     status: String,
     message: Option<String>,
     task_id: Option<String>,
     filename: Option<String>,
+}
+
+fn get_ipc_socket_path() -> PathBuf {
+    if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime_dir).join("illusion.sock")
+    } else {
+        let uid = std::process::id();
+        PathBuf::from(format!("/tmp/illusion-{}.sock", uid))
+    }
 }
 
 fn read_message<R: Read>(reader: &mut R) -> Result<Option<NativeMessage>> {
@@ -53,6 +65,31 @@ fn write_response<W: Write>(writer: &mut W, response: &NativeResponse) -> Result
     Ok(())
 }
 
+async fn try_forward_to_ipc_socket(msg: &NativeMessage) -> Result<Option<NativeResponse>> {
+    let socket_path = get_ipc_socket_path();
+    if !socket_path.exists() {
+        return Ok(None);
+    }
+
+    let mut stream = match UnixStream::connect(&socket_path).await {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+
+    let payload = serde_json::to_vec(msg)?;
+    stream.write_all(&payload).await?;
+
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf).await?;
+    if n > 0 {
+        if let Ok(resp) = serde_json::from_slice::<NativeResponse>(&buf[..n]) {
+            return Ok(Some(resp));
+        }
+    }
+
+    Ok(None)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let stdin = io::stdin();
@@ -63,11 +100,18 @@ async fn main() -> Result<()> {
     let state = AppState::load_or_default();
 
     while let Ok(Some(msg)) = read_message(&mut reader) {
+        // Try live Unix Domain Socket forwarding first
+        if let Ok(Some(ipc_resp)) = try_forward_to_ipc_socket(&msg).await {
+            let _ = write_response(&mut writer, &ipc_resp);
+            continue;
+        }
+
+        // Fallback if GUI is not running
         match msg.action.as_str() {
             "ping" => {
                 let resp = NativeResponse {
                     status: "pong".to_string(),
-                    message: Some("Illusion Native Host 0.1.0 ready".to_string()),
+                    message: Some("Illusion Native Host 0.1.0 ready (standalone fallback)".to_string()),
                     task_id: None,
                     filename: None,
                 };
@@ -104,7 +148,7 @@ async fn main() -> Result<()> {
 
                     let resp = NativeResponse {
                         status: "success".to_string(),
-                        message: Some("Download added to Illusion queue".to_string()),
+                        message: Some("Download added to Illusion state & spawned GUI".to_string()),
                         task_id: Some(task_id),
                         filename: Some(filename),
                     };

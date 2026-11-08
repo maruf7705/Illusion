@@ -31,6 +31,13 @@ pub async fn probe_url(
         }
     }
 
+    if !custom_headers.contains_key(reqwest::header::USER_AGENT) {
+        custom_headers.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        );
+    }
+
     // Try HEAD request first
     let head_req = client.head(url_str).headers(custom_headers.clone());
     let resp = head_req.send().await;
@@ -94,6 +101,10 @@ pub async fn probe_url(
         let get_resp = client.get(url_str).headers(probe_headers).send().await?;
         let status = get_resp.status();
         let headers = get_resp.headers();
+
+        if !status.is_success() && status.as_u16() != 206 {
+            return Err(anyhow::anyhow!("Remote server returned HTTP status {}", status));
+        }
 
         if status.as_u16() == 206 {
             accept_ranges = true;

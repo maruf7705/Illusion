@@ -5,7 +5,7 @@ pub mod state;
 pub mod storage;
 pub mod task;
 
-pub use engine::DownloadEngine;
+pub use engine::{DownloadEngine, RateLimiter};
 pub use prober::{probe_url, RemoteInfo};
 pub use segment::{Segment, SegmentStatus};
 pub use state::AppState;

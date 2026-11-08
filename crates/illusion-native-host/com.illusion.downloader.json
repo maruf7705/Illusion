@@ -1,13 +1,9 @@
 {
   "name": "com.illusion.downloader",
-  "description": "Illusion Native Messaging Host for Chromium, Chrome, and Firefox",
+  "description": "Illusion Native Messaging Host",
   "path": "/home/sadi/.local/bin/illusion-native-host",
   "type": "stdio",
   "allowed_origins": [
-    "chrome-extension://*",
-    "moz-extension://*"
-  ],
-  "allowed_extensions": [
-    "illusion@archlinux.org"
+    "chrome-extension://jfnhbpdihmchildojijlbjlldbenpdhh/"
   ]
 }

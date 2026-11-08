@@ -1,15 +1,18 @@
 {
   "manifest_version": 3,
   "name": "Illusion Download Integration",
-  "version": "1.0.0",
-  "description": "High-performance IDM integration with native multi-segment acceleration and media sniffer for Arch Linux & Hyprland.",
+  "version": "1.1.0",
+  "description": "High-performance IDM video/audio sniffer and multi-segment download acceleration for Arch Linux & Hyprland.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsPjNjqbyWDBbMhcIppLbAHvjcUT0fZbGkOErxjCVE2L3lEH2Y+Ou1iEPcJdYxETbj9YOjjJFXhimWFdlfA4yG0gEvxHwHMHrR2lLBqR2jS5POV2BniUwt/S2vHEWFNsGGr/VaxGKv4GEKR5E+Sesp9o85fdMljTLIeAx7fFzUV3uqUruX5Pqp3Bpi/D1/+Aw/CmfWz1jxfC8eXYuhU0TNpGycZHqAWG6lU8TZmKzHE4KSgq02dUL55lNoAvi7n1eCE4upqhqR9pjrsLPyFfsDsJDG6ybTUM1m5mJzqeG6uOjzJphrUNhtWY8zy1MGeOvPTjhIp23a/OIxkg/BOgLJQIDAQAB",
   "permissions": [
     "downloads",
     "nativeMessaging",
     "contextMenus",
     "storage",
     "cookies",
-    "webRequest"
+    "webRequest",
+    "tabs",
+    "activeTab"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -20,9 +23,10 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["sniffer.js", "content.js"],
+      "js": ["sniffer.js"],
       "css": ["sniffer.css"],
-      "run_at": "document_end"
+      "run_at": "document_end",
+      "all_frames": true
     }
   ],
   "action": {

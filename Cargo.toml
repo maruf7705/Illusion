@@ -34,5 +34,7 @@ directories = "5.0"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 urlencoding = "2.1"
 eframe = "0.29"
+ksni = "0.3.7"
+arboard = "3.4"
 rfd = "0.15"
 open = "5.3"

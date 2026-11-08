@@ -14,10 +14,49 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
+#[derive(Clone, Debug)]
+pub struct RateLimiter {
+    pub limit_bytes_per_sec: Arc<AtomicU64>,
+}
+
+impl RateLimiter {
+    pub fn new(limit_bytes_per_sec: u64) -> Self {
+        Self {
+            limit_bytes_per_sec: Arc::new(AtomicU64::new(limit_bytes_per_sec)),
+        }
+    }
+
+    pub fn set_limit(&self, limit: u64) {
+        self.limit_bytes_per_sec.store(limit, Ordering::Relaxed);
+    }
+
+    pub fn get_limit(&self) -> u64 {
+        self.limit_bytes_per_sec.load(Ordering::Relaxed)
+    }
+
+    pub async fn throttle(&self, bytes: usize) {
+        let limit = self.get_limit();
+        if limit == 0 || bytes == 0 {
+            return;
+        }
+
+        let secs = bytes as f64 / limit as f64;
+        let sleep_duration = Duration::from_secs_f64(secs);
+        sleep(sleep_duration).await;
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 #[derive(Clone)]
 pub struct DownloadEngine {
     client: reqwest::Client,
     max_connections: usize,
+    pub rate_limiter: RateLimiter,
 }
 
 impl DownloadEngine {
@@ -31,7 +70,17 @@ impl DownloadEngine {
         Self {
             client,
             max_connections: max_connections.clamp(1, 32),
+            rate_limiter: RateLimiter::default(),
         }
+    }
+
+    pub fn with_rate_limiter(mut self, rate_limiter: RateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
+    }
+
+    pub fn set_speed_limit(&self, limit_bytes_per_sec: u64) {
+        self.rate_limiter.set_limit(limit_bytes_per_sec);
     }
 
     pub async fn run_task(
@@ -95,6 +144,11 @@ impl DownloadEngine {
             }
         };
 
+        // Ensure user agent
+        let user_agent = task.user_agent.clone().or_else(|| {
+            Some("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36".to_string())
+        });
+
         // Initialize Disk Storage
         let storage = DiskStorage::create_or_open(&task.save_path, total_size).await?;
 
@@ -105,7 +159,7 @@ impl DownloadEngine {
                 total_size.unwrap(),
                 &task.headers,
                 task.cookies.as_deref(),
-                task.user_agent.as_deref(),
+                user_agent.as_deref(),
                 storage.clone(),
                 state.clone(),
                 &mut cancel_rx,
@@ -117,7 +171,7 @@ impl DownloadEngine {
                 &task.url,
                 &task.headers,
                 task.cookies.as_deref(),
-                task.user_agent.as_deref(),
+                user_agent.as_deref(),
                 storage.clone(),
                 state.clone(),
                 &mut cancel_rx,
@@ -246,6 +300,7 @@ impl DownloadEngine {
             let headers_map = headers_map.clone();
             let cookies = cookies.map(|s| s.to_string());
             let user_agent = user_agent.map(|s| s.to_string());
+            let rate_limiter = self.rate_limiter.clone();
             let seg_id = seg.id;
 
             tokio::spawn(async move {
@@ -260,6 +315,7 @@ impl DownloadEngine {
                     headers_map,
                     cookies,
                     user_agent,
+                    rate_limiter,
                 )
                 .await;
                 let _ = done_tx.send(()).await;
@@ -346,6 +402,7 @@ impl DownloadEngine {
                             let headers_map = headers_map.clone();
                             let cookies = cookies.map(|s| s.to_string());
                             let user_agent = user_agent.map(|s| s.to_string());
+                            let rate_limiter = self.rate_limiter.clone();
 
                             tokio::spawn(async move {
                                 let _ = run_segment_worker(
@@ -359,6 +416,7 @@ impl DownloadEngine {
                                     headers_map,
                                     cookies,
                                     user_agent,
+                                    rate_limiter,
                                 )
                                 .await;
                                 let _ = done_tx.send(()).await;
@@ -407,6 +465,9 @@ impl DownloadEngine {
         }
 
         let mut resp = self.client.get(url).headers(headers).send().await?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("Server returned HTTP {}", resp.status()));
+        }
         let mut downloaded: u64 = 0;
         let mut last_instant = Instant::now();
         let mut last_bytes: u64 = 0;
@@ -419,6 +480,9 @@ impl DownloadEngine {
             let len = chunk_res.len() as u64;
             storage.write_at(downloaded, chunk_res.to_vec()).await?;
             downloaded += len;
+
+            // Throttle speed if rate limiter is active
+            self.rate_limiter.throttle(len as usize).await;
 
             let now = Instant::now();
             let elapsed = now.duration_since(last_instant).as_secs_f64();
@@ -451,6 +515,7 @@ async fn run_segment_worker(
     headers_map: HashMap<String, String>,
     cookies: Option<String>,
     user_agent: Option<String>,
+    rate_limiter: RateLimiter,
 ) -> Result<()> {
     // Mark segment as downloading
     let (mut current, mut end) = {
@@ -516,6 +581,9 @@ async fn run_segment_worker(
             storage.write_at(current, chunk.to_vec()).await?;
             current += len;
             total_dl.fetch_add(len, Ordering::Relaxed);
+
+            // Throttle speed if rate limiter is active
+            rate_limiter.throttle(len as usize).await;
 
             // Update segment current pointer and get possibly updated end
             {

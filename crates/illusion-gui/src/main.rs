@@ -1,18 +1,22 @@
+mod ipc;
+mod tray;
+
 use eframe::egui::{self, Color32, Margin, Pos2, Rect, Rounding, Stroke, Vec2};
 use illusion_core::{
-    format_bytes, AppState, DownloadCategory, DownloadEngine, DownloadTask, SegmentStatus,
-    TaskStatus,
+    format_bytes, AppState, DownloadCategory, DownloadEngine, DownloadTask, RateLimiter,
+    SegmentStatus, TaskStatus,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Default)]
 struct DialogState {
     show_add_url: bool,
-    input_url: String,
+    input_text: String, // Multiline support for batch ingestion
     input_filename: String,
     input_save_dir: PathBuf,
 }
@@ -21,15 +25,30 @@ struct ActiveDownloadWorker {
     cancel_tx: watch::Sender<bool>,
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum SpeedPreset {
+    Unlimited,
+    Kb512,
+    Mb1,
+    Mb2,
+    Mb5,
+    Mb10,
+}
+
 struct IllusionApp {
     state: AppState,
     selected_category: DownloadCategory,
     selected_task_id: Option<String>,
     dialog: DialogState,
     max_connections: usize,
+    speed_preset: SpeedPreset,
     engine: DownloadEngine,
+    rate_limiter: RateLimiter,
     active_workers: HashMap<String, ActiveDownloadWorker>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
+    pause_all_flag: Arc<AtomicBool>,
+    resume_all_flag: Arc<AtomicBool>,
+    ipc_rx: mpsc::UnboundedReceiver<String>,
 }
 
 impl IllusionApp {
@@ -54,20 +73,38 @@ impl IllusionApp {
         let state = AppState::load_or_default();
         let default_dir = state.default_download_dir.clone();
 
+        let rate_limiter = RateLimiter::new(0);
+        let engine = DownloadEngine::new(8).with_rate_limiter(rate_limiter.clone());
+
+        let pause_all_flag = Arc::new(AtomicBool::new(false));
+        let resume_all_flag = Arc::new(AtomicBool::new(false));
+
+        // Spawn StatusNotifierItem Tray for Waybar / Hyprland
+        tray::spawn_tray(rt.clone(), pause_all_flag.clone(), resume_all_flag.clone());
+
+        // Spawn Unix Domain Socket IPC Daemon
+        let (ipc_tx, ipc_rx) = mpsc::unbounded_channel::<String>();
+        ipc::start_ipc_server(rt.clone(), state.clone(), ipc_tx);
+
         Self {
             state,
             selected_category: DownloadCategory::All,
             selected_task_id: None,
             dialog: DialogState {
                 show_add_url: false,
-                input_url: String::new(),
+                input_text: String::new(),
                 input_filename: String::new(),
                 input_save_dir: default_dir,
             },
             max_connections: 8,
-            engine: DownloadEngine::new(8),
+            speed_preset: SpeedPreset::Unlimited,
+            engine,
+            rate_limiter,
             active_workers: HashMap::new(),
             tokio_rt: rt,
+            pause_all_flag,
+            resume_all_flag,
+            ipc_rx,
         }
     }
 
@@ -94,6 +131,36 @@ impl IllusionApp {
             let _ = worker.cancel_tx.send(true);
         }
     }
+
+    fn pause_all(&mut self) {
+        let ids: Vec<String> = self.active_workers.keys().cloned().collect();
+        for id in ids {
+            self.pause_download(&id);
+        }
+    }
+
+    fn resume_all(&mut self) {
+        let tasks = self.tokio_rt.block_on(async {
+            self.state.tasks.read().await.clone()
+        });
+        for task in tasks {
+            if task.status == TaskStatus::Paused || task.status == TaskStatus::Queued {
+                self.start_download(task.id);
+            }
+        }
+    }
+
+    fn apply_speed_limit(&self) {
+        let bytes_per_sec = match self.speed_preset {
+            SpeedPreset::Unlimited => 0,
+            SpeedPreset::Kb512 => 512 * 1024,
+            SpeedPreset::Mb1 => 1024 * 1024,
+            SpeedPreset::Mb2 => 2 * 1024 * 1024,
+            SpeedPreset::Mb5 => 5 * 1024 * 1024,
+            SpeedPreset::Mb10 => 10 * 1024 * 1024,
+        };
+        self.rate_limiter.set_limit(bytes_per_sec);
+    }
 }
 
 impl eframe::App for IllusionApp {
@@ -102,6 +169,20 @@ impl eframe::App for IllusionApp {
         let has_active = !self.active_workers.is_empty();
         if has_active {
             ctx.request_repaint_after(Duration::from_millis(200));
+        }
+
+        // Process IPC messages from browser native host
+        while let Ok(task_id) = self.ipc_rx.try_recv() {
+            self.selected_task_id = Some(task_id.clone());
+            self.start_download(task_id);
+        }
+
+        // Process Tray Flags
+        if self.pause_all_flag.swap(false, Ordering::Relaxed) {
+            self.pause_all();
+        }
+        if self.resume_all_flag.swap(false, Ordering::Relaxed) {
+            self.resume_all();
         }
 
         // Clean up finished workers
@@ -127,10 +208,19 @@ impl eframe::App for IllusionApp {
                     ui.label(egui::RichText::new("⚡ ILLUSION").strong().color(Color32::from_rgb(137, 180, 250)).size(18.0));
                     ui.separator();
 
-                    if ui.button(egui::RichText::new("＋ Add URL").strong()).clicked() {
+                    if ui.button(egui::RichText::new("＋ Add Download").strong()).clicked() {
                         self.dialog.show_add_url = true;
-                        self.dialog.input_url = String::new();
+                        self.dialog.input_text = String::new();
                         self.dialog.input_filename = String::new();
+
+                        // Auto-populate from clipboard if clipboard contains URL
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            if let Ok(text) = clipboard.get_text() {
+                                if text.contains("http://") || text.contains("https://") {
+                                    self.dialog.input_text = text.trim().to_string();
+                                }
+                            }
+                        }
                     }
 
                     ui.separator();
@@ -168,6 +258,33 @@ impl eframe::App for IllusionApp {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!("Speed: {}", self.calc_total_speed()));
+                        ui.separator();
+
+                        // Speed Limiter Selector
+                        ui.label("Throttle:");
+                        let old_preset = self.speed_preset;
+                        egui::ComboBox::from_id_salt("speed_limit_combo")
+                            .selected_text(match self.speed_preset {
+                                SpeedPreset::Unlimited => "Unlimited",
+                                SpeedPreset::Kb512 => "512 KB/s",
+                                SpeedPreset::Mb1 => "1 MB/s",
+                                SpeedPreset::Mb2 => "2 MB/s",
+                                SpeedPreset::Mb5 => "5 MB/s",
+                                SpeedPreset::Mb10 => "10 MB/s",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.speed_preset, SpeedPreset::Unlimited, "Unlimited");
+                                ui.selectable_value(&mut self.speed_preset, SpeedPreset::Kb512, "512 KB/s");
+                                ui.selectable_value(&mut self.speed_preset, SpeedPreset::Mb1, "1 MB/s");
+                                ui.selectable_value(&mut self.speed_preset, SpeedPreset::Mb2, "2 MB/s");
+                                ui.selectable_value(&mut self.speed_preset, SpeedPreset::Mb5, "5 MB/s");
+                                ui.selectable_value(&mut self.speed_preset, SpeedPreset::Mb10, "10 MB/s");
+                            });
+
+                        if self.speed_preset != old_preset {
+                            self.apply_speed_limit();
+                        }
+
                         ui.separator();
                         ui.add(egui::Slider::new(&mut self.max_connections, 1..=32).text("Threads"));
                     });
@@ -287,22 +404,55 @@ impl eframe::App for IllusionApp {
                 });
             });
 
-        // 5. Add URL Dialog Modal
+        // 5. Add URL / Multiline Batch Download Modal
         if self.dialog.show_add_url {
             let mut close = false;
             let mut start_now = false;
 
-            egui::Window::new("Add Download")
+            egui::Window::new("Add Download / Batch Queue")
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .fixed_size([520.0, 260.0])
+                .fixed_size([580.0, 340.0])
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Enter the address (URL) to download:").strong());
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Enter download URL(s) - one per line for batch:").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("📋 Paste from Clipboard").clicked() {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    if let Ok(text) = clipboard.get_text() {
+                                        self.dialog.input_text = text.trim().to_string();
+                                    }
+                                }
+                            }
+                        });
+                    });
 
                     ui.add_space(4.0);
-                    ui.text_edit_singleline(&mut self.dialog.input_url);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.dialog.input_text)
+                            .desired_rows(4)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("https://example.com/file1.zip\nhttps://example.com/file2.tar.gz"),
+                    );
+
+                    // Count valid URLs in input
+                    let urls: Vec<&str> = self
+                        .dialog
+                        .input_text
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
+                        .collect();
+
+                    if urls.len() > 1 {
+                        ui.label(
+                            egui::RichText::new(format!("📦 Batch Mode: {} URLs detected", urls.len()))
+                                .color(Color32::from_rgb(166, 227, 161))
+                                .strong(),
+                        );
+                    }
 
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -318,26 +468,34 @@ impl eframe::App for IllusionApp {
                         }
                     });
 
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.label("File Name (Optional):");
-                        ui.text_edit_singleline(&mut self.dialog.input_filename);
-                    });
+                    if urls.len() <= 1 {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("File Name (Optional):");
+                            ui.text_edit_singleline(&mut self.dialog.input_filename);
+                        });
+                    }
 
                     ui.add_space(16.0);
                     ui.separator();
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
-                        if ui.button(egui::RichText::new("▶ Download Now").strong()).clicked() {
-                            if !self.dialog.input_url.trim().is_empty() {
+                        let btn_text = if urls.len() > 1 {
+                            format!("▶ Batch Download All ({})", urls.len())
+                        } else {
+                            "▶ Download Now".to_string()
+                        };
+
+                        if ui.button(egui::RichText::new(btn_text).strong()).clicked() {
+                            if !urls.is_empty() {
                                 start_now = true;
                                 close = true;
                             }
                         }
 
-                        if ui.button("Download Later").clicked() {
-                            if !self.dialog.input_url.trim().is_empty() {
+                        if ui.button("Queue for Later").clicked() {
+                            if !urls.is_empty() {
                                 close = true;
                             }
                         }
@@ -348,33 +506,46 @@ impl eframe::App for IllusionApp {
                     });
                 });
 
-            if start_now || (close && !self.dialog.input_url.trim().is_empty()) {
-                let url = self.dialog.input_url.trim().to_string();
-                let mut filename = self.dialog.input_filename.trim().to_string();
-                if filename.is_empty() {
-                    filename = url.split('/').last().unwrap_or("download").to_string();
-                }
-                filename = illusion_core::prober::sanitize_filename(&filename);
-                let save_path = self.dialog.input_save_dir.join(&filename);
+            let urls: Vec<String> = self
+                .dialog
+                .input_text
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| l.starts_with("http://") || l.starts_with("https://"))
+                .collect();
 
-                let task = DownloadTask::new(
-                    url,
-                    filename,
-                    save_path,
-                    None,
-                    HashMap::new(),
-                    None,
-                    Some("Illusion/0.1.0".to_string()),
-                );
+            if start_now || (close && !urls.is_empty()) {
+                let save_dir = self.dialog.input_save_dir.clone();
+                let custom_name = self.dialog.input_filename.trim().to_string();
 
-                let task_id = task.id.clone();
-                let state = self.state.clone();
-                self.tokio_rt.block_on(async {
-                    state.add_task(task).await;
-                });
+                for (idx, url) in urls.into_iter().enumerate() {
+                    let mut filename = if idx == 0 && !custom_name.is_empty() {
+                        custom_name.clone()
+                    } else {
+                        url.split('/').last().unwrap_or("download").to_string()
+                    };
+                    filename = illusion_core::prober::sanitize_filename(&filename);
+                    let save_path = save_dir.join(&filename);
 
-                if start_now {
-                    self.start_download(task_id);
+                    let task = DownloadTask::new(
+                        url,
+                        filename,
+                        save_path,
+                        None,
+                        HashMap::new(),
+                        None,
+                        Some("Illusion/0.1.0".to_string()),
+                    );
+
+                    let task_id = task.id.clone();
+                    let state = self.state.clone();
+                    self.tokio_rt.block_on(async {
+                        state.add_task(task).await;
+                    });
+
+                    if start_now {
+                        self.start_download(task_id);
+                    }
                 }
             }
 
@@ -489,11 +660,12 @@ fn main() -> eframe::Result<()> {
             .build()
             .expect("Failed to build Tokio runtime"),
     );
+    let _guard = rt.enter();
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Illusion Download Manager")
-            .with_inner_size([960.0, 600.0])
+            .with_inner_size([980.0, 620.0])
             .with_min_inner_size([640.0, 400.0])
             .with_app_id("illusion"),
         ..Default::default()
