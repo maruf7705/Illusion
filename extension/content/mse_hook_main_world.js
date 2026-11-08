@@ -166,7 +166,34 @@
   // 5. Global Player Response Introspection (YouTube & SPA Players)
   function inspectGlobalPlayerState(overrideUrl) {
     try {
-      const pr = window.ytInitialPlayerResponse || (window.ytplayer && window.ytplayer.config && window.ytplayer.config.args && JSON.parse(window.ytplayer.config.args.raw_player_response));
+      let pr = window.ytInitialPlayerResponse;
+      if (!pr) {
+        const mp = document.getElementById("movie_player");
+        if (mp && typeof mp.getPlayerResponse === "function") {
+          pr = mp.getPlayerResponse();
+        }
+      }
+      if (!pr && window.ytplayer && window.ytplayer.config && window.ytplayer.config.args) {
+        try {
+          pr = JSON.parse(window.ytplayer.config.args.raw_player_response);
+        } catch (_) {}
+      }
+      if (!pr) {
+        // Fallback: search inline scripts for ytInitialPlayerResponse
+        const scripts = document.getElementsByTagName("script");
+        for (const s of scripts) {
+          if (s.textContent && s.textContent.includes("ytInitialPlayerResponse = {")) {
+            const m = s.textContent.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/);
+            if (m && m[1]) {
+              try {
+                pr = JSON.parse(m[1]);
+                break;
+              } catch (_) {}
+            }
+          }
+        }
+      }
+
       if (!pr || !pr.streamingData) return;
 
       const streaming = pr.streamingData;
@@ -191,6 +218,9 @@
               bestAudioUrl = u.toString();
               break;
             } catch (_) {}
+          } else {
+            bestAudioUrl = `${window.location.origin}/videoplayback?itag=${fmt.itag}`;
+            break;
           }
         }
       }
@@ -208,15 +238,17 @@
             streamUrl = u.toString();
           } catch (_) {}
         }
-        if (streamUrl) {
-          emitMediaDiscovery({
-            url: streamUrl,
-            quality: f.qualityLabel || `${f.height || 360}p`,
-            mime: f.mimeType || "video/mp4",
-            size: parseInt(f.contentLength || "0", 10) || 0,
-            audioUrl: null
-          });
+        if (!streamUrl) {
+          streamUrl = `${window.location.origin}/videoplayback?itag=${f.itag}`;
         }
+
+        emitMediaDiscovery({
+          url: streamUrl,
+          quality: f.qualityLabel || `${f.height || 360}p`,
+          mime: f.mimeType || "video/mp4",
+          size: parseInt(f.contentLength || "0", 10) || 0,
+          audioUrl: null
+        });
       });
 
       // 2. Process adaptive video & audio formats
@@ -232,17 +264,19 @@
             streamUrl = u.toString();
           } catch (_) {}
         }
-        if (streamUrl) {
-          const isAudio = f.mimeType && f.mimeType.includes("audio");
-          const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
-          emitMediaDiscovery({
-            url: streamUrl,
-            quality: qLabel,
-            mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
-            size: parseInt(f.contentLength || "0", 10) || 0,
-            audioUrl: isAudio ? null : bestAudioUrl
-          });
+        if (!streamUrl) {
+          streamUrl = `${window.location.origin}/videoplayback?itag=${f.itag}`;
         }
+
+        const isAudio = f.mimeType && f.mimeType.includes("audio");
+        const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
+        emitMediaDiscovery({
+          url: streamUrl,
+          quality: qLabel,
+          mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
+          size: parseInt(f.contentLength || "0", 10) || 0,
+          audioUrl: isAudio ? null : bestAudioUrl
+        });
       });
     } catch (_) {}
   }
