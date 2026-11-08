@@ -1,190 +1,195 @@
-/* Illusion IDM-Grade Floating Video/Audio Download Panel */
+/* Illusion IDM Authentic Floating Download Bar & Context Menu */
+/* Reverse Engineered from IDM Win32 Aero Architecture */
+
 .illusion-video-bar-container {
   position: absolute;
-  top: 16px;
-  right: 16px;
+  top: 14px;
+  left: 14px;
   z-index: 2147483647 !important;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  font-size: 13px;
-  user-select: none;
-  direction: ltr;
-  text-align: left;
+  font-family: Tahoma, "Segoe UI", Arial, sans-serif !important;
+  font-size: 11px !important;
+  user-select: none !important;
+  direction: ltr !important;
+  text-align: left !important;
   pointer-events: auto !important;
   opacity: 1 !important;
-  display: block !important;
-  visibility: visible !important;
+  display: inline-flex !important;
+  flex-direction: column !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  line-height: normal !important;
 }
 
+/* Authentic IDM Aero Glossy Button */
 .illusion-video-bar-btn {
-  display: flex !important;
-  align-items: center;
-  gap: 8px;
-  background: rgba(30, 30, 46, 0.96) !important;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  color: #cdd6f4 !important;
-  border: 1px solid rgba(137, 180, 250, 0.6) !important;
-  border-radius: 8px;
-  padding: 8px 14px;
-  cursor: pointer;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-  pointer-events: auto !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  height: 22px !important;
+  box-sizing: border-box !important;
+  padding: 0 4px 0 6px !important;
+  background: linear-gradient(to bottom, #f2f7fd 0%, #e1edf9 40%, #c4ddf7 50%, #d4e7fa 100%) !important;
+  border: 1px solid #7599cb !important;
+  border-radius: 3px !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.9) !important;
+  cursor: pointer !important;
+  gap: 5px !important;
+  transition: filter 0.15s ease, border-color 0.15s ease !important;
 }
 
 .illusion-video-bar-btn:hover {
-  background: rgba(36, 39, 58, 0.98);
-  border-color: #89b4fa;
-  box-shadow: 0 6px 22px rgba(137, 180, 250, 0.35);
-  transform: translateY(-1px);
+  background: linear-gradient(to bottom, #f8fbfe 0%, #ebf3fc 40%, #d2e4f9 50%, #e0effc 100%) !important;
+  border-color: #5884bf !important;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 1) !important;
 }
 
-.illusion-video-icon {
-  width: 16px;
-  height: 16px;
-  fill: #89b4fa;
-  flex-shrink: 0;
+.illusion-video-bar-btn:active {
+  background: linear-gradient(to bottom, #c6ddf7 0%, #b8d4f4 50%, #d0e4f9 100%) !important;
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.3) !important;
 }
 
+/* Green 3D Play Triangle Icon */
+.idm-play-triangle {
+  width: 0 !important;
+  height: 0 !important;
+  border-top: 5px solid transparent !important;
+  border-bottom: 5px solid transparent !important;
+  border-left: 9px solid #1ba829 !important;
+  filter: drop-shadow(0 1px 0 #0d610d) !important;
+  margin-right: 2px !important;
+  flex-shrink: 0 !important;
+}
+
+/* Main IDM Navy Bold Text */
 .illusion-video-text {
-  font-weight: 600;
-  color: #cdd6f4;
-  white-space: nowrap;
+  font-family: Tahoma, "Segoe UI", Arial, sans-serif !important;
+  font-size: 11px !important;
+  font-weight: bold !important;
+  color: #1a3b68 !important;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.85) !important;
+  white-space: nowrap !important;
+  line-height: 1 !important;
+  letter-spacing: -0.1px !important;
 }
 
-.illusion-badge {
-  background: #89b4fa;
-  color: #11111b;
-  font-size: 11px;
-  font-weight: 700;
-  padding: 1px 6px;
-  border-radius: 10px;
+/* Stream count pill badge */
+.illusion-stream-badge {
+  background: #2b6cb0 !important;
+  color: #ffffff !important;
+  font-size: 9px !important;
+  font-weight: bold !important;
+  padding: 0 4px !important;
+  border-radius: 8px !important;
+  line-height: 13px !important;
+  margin-left: 1px !important;
 }
 
-.illusion-pin-btn {
-  font-size: 11px;
-  font-weight: bold;
-  color: #a6adc8;
-  padding: 1px 4px;
-  margin-left: 2px;
-  border-radius: 4px;
-  cursor: pointer;
-  transition: all 0.2s ease;
+/* Right-side action buttons: Help [?] and Close [X] */
+.idm-btn-group {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 2px !important;
+  margin-left: 2px !important;
 }
 
-.illusion-pin-btn:hover {
-  background: rgba(255, 255, 255, 0.15);
-  color: #f38ba8;
+.idm-btn-help,
+.idm-btn-close {
+  width: 14px !important;
+  height: 14px !important;
+  box-sizing: border-box !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-family: Tahoma, "Segoe UI", Arial, sans-serif !important;
+  font-size: 9px !important;
+  font-weight: bold !important;
+  color: #1a3b68 !important;
+  background: linear-gradient(to bottom, #fbfdfe 0%, #d8e8f8 100%) !important;
+  border: 1px solid #7599cb !important;
+  border-radius: 2px !important;
+  box-shadow: 0 1px 1px rgba(0, 0, 0, 0.15) !important;
+  cursor: pointer !important;
+  line-height: 1 !important;
+  padding: 0 !important;
 }
 
-/* Minimized collapsed state */
-.illusion-video-bar-container.minimized .illusion-video-text,
-.illusion-video-bar-container.minimized .illusion-badge,
-.illusion-video-bar-container.minimized .illusion-arrow {
+.idm-btn-help:hover,
+.idm-btn-close:hover {
+  background: #dbeaf9 !important;
+  border-color: #5b87c1 !important;
+  color: #0c274d !important;
+}
+
+.idm-btn-close:hover {
+  background: #fde8e8 !important;
+  border-color: #e07070 !important;
+  color: #c5221f !important;
+}
+
+/* Authentic Windows IDM Context Menu Dropdown */
+.illusion-dropdown-menu {
+  position: absolute !important;
+  top: 23px !important;
+  left: 0 !important;
+  background: #ffffff !important;
+  border: 1px solid #7f9db9 !important;
+  box-shadow: 2px 2px 4px rgba(0, 0, 0, 0.3) !important;
+  padding: 2px 0 !important;
+  min-width: 210px !important;
+  z-index: 2147483647 !important;
   display: none !important;
+  flex-direction: column !important;
+  box-sizing: border-box !important;
+  font-family: Tahoma, "Segoe UI", Arial, sans-serif !important;
+  font-size: 11px !important;
 }
 
-.illusion-video-bar-container.minimized .illusion-stream-dropdown {
+.illusion-dropdown-menu.visible {
+  display: flex !important;
+}
+
+/* Top "Download all" item */
+.idm-menu-item {
+  padding: 3px 18px 3px 22px !important;
+  font-size: 11px !important;
+  font-family: Tahoma, "Segoe UI", Arial, sans-serif !important;
+  color: #000000 !important;
+  background: transparent !important;
+  cursor: pointer !important;
+  white-space: nowrap !important;
+  user-select: none !important;
+  text-align: left !important;
+  box-sizing: border-box !important;
+  line-height: 16px !important;
+}
+
+/* Authentic Windows Hover Blue Highlight */
+.idm-menu-item:hover,
+.idm-menu-item.highlighted {
+  background: #b6d6f2 !important;
+  outline: 1px solid #7da2ce !important;
+  outline-offset: -1px !important;
+  color: #000000 !important;
+}
+
+/* Separator Line */
+.idm-menu-sep {
+  height: 1px !important;
+  background: #e0e0e0 !important;
+  margin: 3px 1px !important;
+  padding: 0 !important;
+}
+
+/* Minimized Floating State */
+.illusion-video-bar-container.minimized .illusion-video-text,
+.illusion-video-bar-container.minimized .illusion-stream-badge,
+.illusion-video-bar-container.minimized .idm-btn-group,
+.illusion-video-bar-container.minimized .illusion-dropdown-menu {
   display: none !important;
 }
 
 .illusion-video-bar-container.minimized .illusion-video-bar-btn {
-  padding: 7px !important;
+  width: 22px !important;
+  padding: 0 !important;
+  justify-content: center !important;
   border-radius: 50% !important;
-  background: rgba(137, 180, 250, 0.95) !important;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5) !important;
-}
-
-.illusion-video-bar-container.minimized .illusion-video-icon {
-  fill: #11111b !important;
-}
-
-.illusion-arrow {
-  font-size: 10px;
-  color: #a6adc8;
-  margin-left: 2px;
-  transition: transform 0.2s ease;
-}
-
-.illusion-arrow.open {
-  transform: rotate(180deg);
-}
-
-/* Dropdown Menu of Available Streams */
-.illusion-stream-dropdown {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  margin-top: 6px;
-  width: 310px;
-  max-height: 280px;
-  overflow-y: auto;
-  background: #1e1e2e;
-  border: 1px solid rgba(137, 180, 250, 0.3);
-  border-radius: 10px;
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.6);
-  display: none;
-  flex-direction: column;
-  padding: 6px;
-  gap: 4px;
-}
-
-.illusion-stream-dropdown.visible {
-  display: flex;
-}
-
-.illusion-stream-header {
-  font-size: 11px;
-  font-weight: 700;
-  color: #a6adc8;
-  padding: 4px 8px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  border-bottom: 1px solid #313244;
-  margin-bottom: 4px;
-}
-
-.illusion-stream-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 10px;
-  border-radius: 6px;
-  background: transparent;
-  color: #cdd6f4;
-  cursor: pointer;
-  transition: background 0.15s;
-  text-decoration: none;
-}
-
-.illusion-stream-item:hover {
-  background: #313244;
-  color: #89b4fa;
-}
-
-.illusion-stream-info {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.illusion-stream-title {
-  font-weight: 600;
-  font-size: 12px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.illusion-stream-meta {
-  font-size: 10px;
-  color: #a6adc8;
-}
-
-.illusion-dl-action-icon {
-  width: 14px;
-  height: 14px;
-  fill: #89b4fa;
-  flex-shrink: 0;
-  margin-left: 8px;
 }

@@ -106,94 +106,107 @@ function inferQuality(url, mime, sizeBytes) {
 }
 
 // 1. Network-Level Media Request Sniffer (The Core of IDM Video Grabber!)
-chrome.webRequest.onHeadersReceived.addListener(
-  (details) => {
-    if (details.tabId < 0) return;
+async function handleMediaResponse(tabId, details) {
+  if (tabId < 0) return;
 
-    const url = details.url;
-    if (url.startsWith("blob:") || url.startsWith("data:") || url.startsWith("chrome://")) {
-      return;
-    }
+  const url = details.url;
+  if (url.startsWith("blob:") || url.startsWith("data:") || url.startsWith("chrome://")) {
+    return;
+  }
 
-    let contentType = "";
-    let contentLength = 0;
+  let contentType = "";
+  let contentLength = 0;
 
-    if (details.responseHeaders) {
-      for (const h of details.responseHeaders) {
-        const name = h.name.toLowerCase();
-        if (name === "content-type") {
-          contentType = h.value ? h.value.toLowerCase() : "";
-        } else if (name === "content-length") {
-          contentLength = parseInt(h.value || "0", 10) || 0;
-        }
+  if (details.responseHeaders) {
+    for (const h of details.responseHeaders) {
+      const name = h.name.toLowerCase();
+      if (name === "content-type") {
+        contentType = h.value ? h.value.toLowerCase() : "";
+      } else if (name === "content-length") {
+        contentLength = parseInt(h.value || "0", 10) || 0;
       }
     }
+  }
 
-    const cleanUrl = url.split("?")[0].toLowerCase();
-    const isYouTubePlayback = url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback");
+  const cleanUrl = url.split("?")[0].toLowerCase();
+  const isYouTubePlayback = url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback");
 
-    let targetDownloadUrl = url;
-    if (isYouTubePlayback) {
-      try {
-        const u = new URL(url);
-        u.searchParams.delete("range");
-        u.searchParams.delete("rn");
-        targetDownloadUrl = u.toString();
-      } catch (_) {}
+  let targetDownloadUrl = url;
+  if (isYouTubePlayback) {
+    try {
+      const u = new URL(url);
+      u.searchParams.delete("range");
+      u.searchParams.delete("rn");
+      u.searchParams.delete("alr");
+      targetDownloadUrl = u.toString();
+    } catch (_) {}
+  }
+
+  const isMediaMime =
+    contentType.startsWith("video/") ||
+    contentType.startsWith("audio/") ||
+    contentType.includes("application/vnd.apple.mpegurl") ||
+    contentType.includes("application/x-mpegurl") ||
+    contentType.includes("application/dash+xml") ||
+    contentType.includes("application/vnd.yt-ump");
+
+  const isMediaExt =
+    cleanUrl.endsWith(".mp4") ||
+    cleanUrl.endsWith(".m4s") ||
+    cleanUrl.endsWith(".webm") ||
+    cleanUrl.endsWith(".mkv") ||
+    cleanUrl.endsWith(".flv") ||
+    cleanUrl.endsWith(".m3u8") ||
+    cleanUrl.endsWith(".mpd") ||
+    cleanUrl.endsWith(".ts") ||
+    cleanUrl.endsWith(".mov") ||
+    cleanUrl.endsWith(".mp3") ||
+    cleanUrl.endsWith(".m4a") ||
+    cleanUrl.endsWith(".aac") ||
+    cleanUrl.endsWith(".wav");
+
+  // Filter out tiny audio effects/icons (< 100KB unless it is an m3u8 playlist or mpd or YouTube stream)
+  const isPlaylist = cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mpd") || contentType.includes("mpegurl") || contentType.includes("dash");
+  if (!isYouTubePlayback && !isPlaylist && contentLength > 0 && contentLength < 100 * 1024) {
+    return;
+  }
+
+  if (isYouTubePlayback || isMediaMime || isMediaExt) {
+    const streams = await getTabStreams(tabId);
+    if (!streams.some((s) => s.url === targetDownloadUrl)) {
+      const quality = inferQuality(url, contentType, contentLength);
+      const item = {
+        url: targetDownloadUrl,
+        mime: contentType || (isYouTubePlayback ? "video/mp4" : "application/octet-stream"),
+        size: contentLength,
+        quality: quality,
+        timestamp: Date.now()
+      };
+      streams.push(item);
+      await saveTabStreams(tabId, streams);
+
+      // Broadcast to tab's content script to update the floating IDM bar
+      chrome.tabs.sendMessage(tabId, {
+        type: "ILLUSION_STREAM_DETECTED",
+        stream: item,
+        totalCount: streams.length
+      }).catch(() => {});
     }
+  }
+}
 
-    const isMediaMime =
-      contentType.startsWith("video/") ||
-      contentType.startsWith("audio/") ||
-      contentType.includes("application/vnd.apple.mpegurl") ||
-      contentType.includes("application/x-mpegurl") ||
-      contentType.includes("application/dash+xml");
-
-    const isMediaExt =
-      cleanUrl.endsWith(".mp4") ||
-      cleanUrl.endsWith(".m4s") ||
-      cleanUrl.endsWith(".webm") ||
-      cleanUrl.endsWith(".mkv") ||
-      cleanUrl.endsWith(".flv") ||
-      cleanUrl.endsWith(".m3u8") ||
-      cleanUrl.endsWith(".mpd") ||
-      cleanUrl.endsWith(".ts") ||
-      cleanUrl.endsWith(".mov") ||
-      cleanUrl.endsWith(".mp3") ||
-      cleanUrl.endsWith(".m4a") ||
-      cleanUrl.endsWith(".aac") ||
-      cleanUrl.endsWith(".wav");
-
-    // Filter out tiny audio effects/icons (< 200KB unless it is an m3u8 playlist or mpd or YouTube stream)
-    const isPlaylist = cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mpd") || contentType.includes("mpegurl") || contentType.includes("dash");
-    if (!isYouTubePlayback && !isPlaylist && contentLength > 0 && contentLength < 200 * 1024) {
-      return;
-    }
-
-    if (isYouTubePlayback || isMediaMime || isMediaExt) {
-      getTabStreams(details.tabId).then((streams) => {
-        // Avoid duplicates
-        if (!streams.some((s) => s.url === targetDownloadUrl)) {
-          const quality = inferQuality(url, contentType, contentLength);
-          const item = {
-            url: targetDownloadUrl,
-            mime: contentType || (isYouTubePlayback ? "video/mp4" : "application/octet-stream"),
-            size: contentLength,
-            quality: quality,
-            timestamp: Date.now()
-          };
-          streams.push(item);
-          saveTabStreams(details.tabId, streams);
-
-          // Broadcast to tab's content script to update the floating IDM bar
-          chrome.tabs.sendMessage(details.tabId, {
-            type: "ILLUSION_STREAM_DETECTED",
-            stream: item,
-            totalCount: streams.length
-          }).catch(() => {});
+chrome.webRequest.onHeadersReceived.addListener(
+  (details) => {
+    let tabId = details.tabId;
+    if (tabId < 0) {
+      chrome.tabs.query({ active: true, lastFocusedWindow: true }).then((tabs) => {
+        if (tabs && tabs.length > 0) {
+          handleMediaResponse(tabs[0].id, details);
         }
       });
+      return;
     }
+    handleMediaResponse(tabId, details);
   },
   {
     urls: ["<all_urls>"],
@@ -302,6 +315,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       audio_url: request.audio_url || null
     }).then(() => {
       sendResponse({ status: "success" });
+    });
+    return true;
+  }
+
+  if (request.type === "OPEN_HELP") {
+    chrome.windows.create({
+      url: chrome.runtime.getURL("batch_grabber.html"),
+      type: "popup",
+      width: 720,
+      height: 560
     });
     return true;
   }

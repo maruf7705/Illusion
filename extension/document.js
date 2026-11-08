@@ -5,23 +5,86 @@
   if (window.__illusion_main_world__) return;
   window.__illusion_main_world__ = true;
 
+  const capturedBuffers = {
+    video: [],
+    audio: [],
+    videoMime: "video/mp4",
+    audioMime: "audio/mp4",
+    totalVideoBytes: 0,
+    totalAudioBytes: 0
+  };
+  window.__illusion_captured_buffers__ = capturedBuffers;
+
+  function cleanUrl(url) {
+    if (!url || typeof url !== "string") return "";
+    try {
+      const u = new URL(url);
+      if (u.hostname.includes("googlevideo.com")) {
+        u.searchParams.delete("range");
+        u.searchParams.delete("rn");
+        u.searchParams.delete("alr");
+        return u.toString();
+      }
+    } catch (_) {}
+    return url;
+  }
+
   function notifyMediaFound(url, quality, mime, audioUrl) {
     if (!url || typeof url !== "string") return;
-    if (url.startsWith("blob:") && !url.includes("youtube.com")) return;
+    if (url.startsWith("blob:") && !url.includes("googlevideo")) return;
+
+    const targetUrl = cleanUrl(url);
 
     window.postMessage(
       {
         type: "__ILLUSION_MEDIA_STREAM__",
-        url: url,
-        quality: quality || "Detected Media Stream",
+        url: targetUrl,
+        quality: quality || "720p HD",
         mime: mime || "video/mp4",
-        audioUrl: audioUrl || null
+        audioUrl: audioUrl ? cleanUrl(audioUrl) : null
       },
       "*"
     );
   }
 
-  // 1. Hook window.fetch
+  // 1. Hook MediaSource & SourceBuffer (IDM-Grade MSE Stream Interception)
+  if (typeof SourceBuffer !== "undefined" && SourceBuffer.prototype.appendBuffer) {
+    const originalAppendBuffer = SourceBuffer.prototype.appendBuffer;
+    SourceBuffer.prototype.appendBuffer = function (buf) {
+      try {
+        if (buf) {
+          const byteLen = buf.byteLength || (buf.buffer ? buf.buffer.byteLength : 0);
+          const isAudio = this.track && this.track.kind === "audio" || (this._mime && this._mime.includes("audio"));
+          if (isAudio) {
+            capturedBuffers.audio.push(buf instanceof ArrayBuffer ? buf : buf.slice(0));
+            capturedBuffers.totalAudioBytes += byteLen;
+          } else {
+            capturedBuffers.video.push(buf instanceof ArrayBuffer ? buf : buf.slice(0));
+            capturedBuffers.totalVideoBytes += byteLen;
+          }
+        }
+      } catch (_) {}
+      return originalAppendBuffer.apply(this, arguments);
+    };
+
+    if (MediaSource.prototype.addSourceBuffer) {
+      const origAddSourceBuffer = MediaSource.prototype.addSourceBuffer;
+      MediaSource.prototype.addSourceBuffer = function (mimeType) {
+        const sb = origAddSourceBuffer.apply(this, arguments);
+        try {
+          sb._mime = mimeType;
+          if (mimeType.includes("audio")) {
+            capturedBuffers.audioMime = mimeType;
+          } else {
+            capturedBuffers.videoMime = mimeType;
+          }
+        } catch (_) {}
+        return sb;
+      };
+    }
+  }
+
+  // 2. Hook window.fetch
   const originalFetch = window.fetch;
   window.fetch = async function (...args) {
     try {
@@ -34,7 +97,7 @@
     return originalFetch.apply(this, args);
   };
 
-  // 2. Hook XMLHttpRequest.prototype.open
+  // 3. Hook XMLHttpRequest.prototype.open
   const originalXHROpen = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (...args) {
     try {
@@ -46,31 +109,29 @@
     return originalXHROpen.apply(this, args);
   };
 
-  // 3. Hook HTMLMediaElement.prototype.play
+  // 4. Hook HTMLMediaElement.prototype.play
   const originalPlay = HTMLMediaElement.prototype.play;
   HTMLMediaElement.prototype.play = function (...args) {
     try {
       const src = this.currentSrc || this.src;
-      if (src) {
+      if (src && src.startsWith("http")) {
         notifyMediaFound(src, this.tagName.toLowerCase() === "audio" ? "Audio Playback" : "Video Playback");
       }
     } catch (_) {}
     return originalPlay.apply(this, args);
   };
 
-  // 4. YouTube In-Page Player Data Introspection
+  // 5. In-Page Player Inspection
   function checkYouTubeData() {
     if (!window.location.hostname.includes("youtube.com")) return;
 
     try {
       const playerResp = window.ytInitialPlayerResponse;
       if (playerResp && playerResp.streamingData) {
-        const title = playerResp.videoDetails ? playerResp.videoDetails.title : (document.title || "YouTube Video");
         const streaming = playerResp.streamingData;
         const formats = streaming.formats || [];
         const adaptive = streaming.adaptiveFormats || [];
 
-        // Check for dedicated audio track to pair with high-res video
         let bestAudioUrl = null;
         for (const fmt of adaptive) {
           if (fmt.mimeType && fmt.mimeType.includes("audio") && fmt.url) {
@@ -79,19 +140,17 @@
           }
         }
 
-        // Process standard muxed formats
         formats.forEach((fmt) => {
           if (fmt.url) {
-            notifyMediaFound(fmt.url, `${fmt.qualityLabel || "720p"} (Video+Audio MP4)`, fmt.mimeType, null);
+            notifyMediaFound(fmt.url, `${fmt.qualityLabel || "720p"} HD`, fmt.mimeType, null);
           }
         });
 
-        // Process high-resolution adaptive formats (1080p, 1440p, 4K) paired with bestAudioUrl
         adaptive.forEach((fmt) => {
           if (fmt.url && fmt.qualityLabel) {
             notifyMediaFound(
               fmt.url,
-              `${fmt.qualityLabel} Full Stream (Muxed via Illusion)`,
+              `${fmt.qualityLabel} HD`,
               fmt.mimeType || "video/mp4",
               bestAudioUrl
             );
