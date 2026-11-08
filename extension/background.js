@@ -15,7 +15,82 @@ const DEFAULT_SETTINGS = {
   ]
 };
 
-// In-memory stream cache per tab with chrome.storage.session persistence
+// 1. Rolling 60-Second Ring Buffer for HTTP Headers & Session Correlation
+const headerRingBuffer = new Map();
+const RING_BUFFER_TTL_MS = 60 * 1000;
+
+function cleanUrlForCorrelation(url) {
+  if (!url) return "";
+  try {
+    const u = new URL(url);
+    return `${u.origin}${u.pathname}`;
+  } catch (_) {
+    return url.split("?")[0];
+  }
+}
+
+function storeInRingBuffer(url, details) {
+  if (!url) return;
+  const now = Date.now();
+  const entry = {
+    headers: details.headers || {},
+    referer: details.referer || "",
+    userAgent: details.userAgent || navigator.userAgent,
+    tabId: details.tabId,
+    timestamp: now
+  };
+
+  headerRingBuffer.set(url, entry);
+  const cleanKey = cleanUrlForCorrelation(url);
+  if (cleanKey !== url) {
+    headerRingBuffer.set(cleanKey, entry);
+  }
+
+  // Prune entries older than 60s
+  if (headerRingBuffer.size > 200) {
+    for (const [k, v] of headerRingBuffer.entries()) {
+      if (now - v.timestamp > RING_BUFFER_TTL_MS) {
+        headerRingBuffer.delete(k);
+      }
+    }
+  }
+}
+
+function getFromRingBuffer(url) {
+  if (!url) return null;
+  if (headerRingBuffer.has(url)) return headerRingBuffer.get(url);
+  const cleanKey = cleanUrlForCorrelation(url);
+  if (headerRingBuffer.has(cleanKey)) return headerRingBuffer.get(cleanKey);
+  return null;
+}
+
+// Capture request headers via webRequest (extraHeaders allows Cookie, Referer, Authorization)
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    const headers = {};
+    let referer = "";
+    let userAgent = "";
+    if (details.requestHeaders) {
+      for (const h of details.requestHeaders) {
+        const name = h.name.toLowerCase();
+        headers[name] = h.value;
+        if (name === "referer") referer = h.value;
+        if (name === "user-agent") userAgent = h.value;
+      }
+    }
+
+    storeInRingBuffer(details.url, {
+      headers,
+      referer,
+      userAgent,
+      tabId: details.tabId
+    });
+  },
+  { urls: ["<all_urls>"] },
+  ["requestHeaders", "extraHeaders"]
+);
+
+// 2. In-memory stream cache per tab with chrome.storage.session persistence
 const tabStreams = new Map();
 
 async function saveTabStreams(tabId, streams) {
@@ -52,27 +127,28 @@ async function removeTabStreams(tabId) {
   }
 }
 
-// Helper to infer quality or stream type
+// 3. YouTube & Streaming Quality Inference
 function inferQuality(url, mime, sizeBytes) {
   const lowerUrl = url.toLowerCase();
   let quality = "";
 
-  // Check YouTube itag
   try {
     const itag = new URL(url).searchParams.get("itag");
     const ytItagMap = {
-      "18": "360p MP4 (Standard)",
-      "22": "720p HD MP4",
-      "137": "1080p Full HD Video",
-      "136": "720p HD Video",
-      "135": "480p SD Video",
-      "134": "360p Video",
-      "140": "Audio Track M4A (128kbps)",
-      "251": "Audio Track Opus (160kbps)",
-      "250": "Audio Track Opus (70kbps)",
-      "249": "Audio Track Opus (50kbps)",
-      "313": "2160p 4K UHD Video",
-      "271": "1440p 2K Video"
+      "18": "360p",
+      "22": "720p HD",
+      "137": "1080p HD",
+      "136": "720p HD",
+      "135": "480p",
+      "134": "360p",
+      "140": "Audio 128k",
+      "251": "Audio 160k",
+      "250": "Audio 70k",
+      "249": "Audio 50k",
+      "313": "2160p 4K",
+      "271": "1440p 2K",
+      "303": "1080p60 HD",
+      "298": "720p60 HD"
     };
     if (itag && ytItagMap[itag]) {
       quality = ytItagMap[itag];
@@ -105,7 +181,7 @@ function inferQuality(url, mime, sizeBytes) {
   return `${quality}${sizeStr}`;
 }
 
-// 1. Network-Level Media Request Sniffer (The Core of IDM Video Grabber!)
+// 4. Network-Level Media Request Sniffer (IDM Core Sniffer)
 async function handleMediaResponse(tabId, details) {
   if (tabId < 0) return;
 
@@ -165,7 +241,6 @@ async function handleMediaResponse(tabId, details) {
     cleanUrl.endsWith(".aac") ||
     cleanUrl.endsWith(".wav");
 
-  // Filter out tiny audio effects/icons (< 100KB unless it is an m3u8 playlist or mpd or YouTube stream)
   const isPlaylist = cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mpd") || contentType.includes("mpegurl") || contentType.includes("dash");
   if (!isYouTubePlayback && !isPlaylist && contentLength > 0 && contentLength < 100 * 1024) {
     return;
@@ -185,12 +260,15 @@ async function handleMediaResponse(tabId, details) {
       streams.push(item);
       await saveTabStreams(tabId, streams);
 
-      // Broadcast to tab's content script to update the floating IDM bar
-      chrome.tabs.sendMessage(tabId, {
-        type: "ILLUSION_STREAM_DETECTED",
-        stream: item,
-        totalCount: streams.length
-      }).catch(() => {});
+      // Notify Top Frame Floating Bar
+      chrome.tabs.sendMessage(
+        tabId,
+        {
+          type: "STREAM_REGISTRY_UPDATED",
+          streams: streams
+        },
+        { frameId: 0 }
+      ).catch(() => {});
     }
   }
 }
@@ -215,7 +293,7 @@ chrome.webRequest.onHeadersReceived.addListener(
   ["responseHeaders"]
 );
 
-// Clear stream cache when tab navigates or closes
+// Tab cleanup
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
     removeTabStreams(tabId);
@@ -226,7 +304,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   removeTabStreams(tabId);
 });
 
-// 2. Intercept regular browser downloads
+// 5. Intercept standard browser downloads
 chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   chrome.storage.local.get("settings", async (data) => {
     const settings = data.settings || DEFAULT_SETTINGS;
@@ -253,12 +331,16 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
           chrome.downloads.erase({ id: downloadItem.id });
         });
 
+        // Correlate with rolling ring buffer headers
+        const ringData = getFromRingBuffer(downloadItem.url) || {};
+
         await sendToIllusion({
           url: downloadItem.url,
           filename: downloadItem.filename,
-          referer: downloadItem.referrer || "",
+          referer: downloadItem.referrer || ringData.referer || "",
           file_size: downloadItem.fileSize || 0,
-          mime_type: downloadItem.mime || ""
+          mime_type: downloadItem.mime || "",
+          headers: ringData.headers || {}
         });
       } catch (err) {
         console.error("[Illusion] Failed to intercept download:", err);
@@ -272,7 +354,7 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   return true;
 });
 
-// 3. Native Messaging communication
+// 6. Native Messaging Communication Bridge
 async function sendToIllusion(details) {
   try {
     let cookiesStr = "";
@@ -282,15 +364,19 @@ async function sendToIllusion(details) {
       cookiesStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     } catch (_) {}
 
+    // Merge cached ring buffer headers if present
+    const ringData = getFromRingBuffer(details.url) || {};
+    const mergedHeaders = Object.assign({}, ringData.headers || {}, details.headers || {});
+
     const payload = {
       action: "add_download",
       url: details.url,
       filename: details.filename || "",
-      referer: details.referer || "",
-      cookies: cookiesStr,
+      referer: details.referer || ringData.referer || "",
+      cookies: cookiesStr || ringData.headers?.cookie || "",
       user_agent: navigator.userAgent,
       audio_url: details.audio_url || null,
-      headers: details.headers || {}
+      headers: mergedHeaders
     };
 
     chrome.runtime.sendNativeMessage(NATIVE_HOST_NAME, payload, (response) => {
@@ -305,16 +391,76 @@ async function sendToIllusion(details) {
   }
 }
 
-// 4. Message dispatcher
+// 7. Inter-Script Message Router
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-  if (request.type === "MEDIA_SNIFFED_DOWNLOAD") {
+  const tabId = sender.tab ? sender.tab.id : -1;
+
+  // Video geometry detected in top frame -> Forward to Floating Bar UI in top frame
+  if (request.type === "TOP_VIDEO_DETECTED") {
+    if (tabId >= 0 && request.rect) {
+      chrome.tabs.sendMessage(tabId, {
+        type: "POSITION_BAR",
+        rect: request.rect
+      }, { frameId: 0 }).catch(() => {});
+    }
+    return;
+  }
+
+  // Video geometry detected inside child iframe -> Forward to top frame
+  if (request.type === "IFRAME_VIDEO_RECT") {
+    if (tabId >= 0 && request.rect) {
+      chrome.tabs.sendMessage(tabId, {
+        type: "POSITION_BAR",
+        rect: request.rect,
+        isIframe: true
+      }, { frameId: 0 }).catch(() => {});
+    }
+    return;
+  }
+
+  // Stream discovered via Main-World MSE Hook (e.g. YouTube ytInitialPlayerResponse or fetch)
+  if (request.type === "ILLUSION_STREAM_DISCOVERED") {
+    if (tabId >= 0 && request.stream && request.stream.url) {
+      getTabStreams(tabId).then((streams) => {
+        const streamUrl = request.stream.url;
+        if (!streams.some((s) => s.url === streamUrl)) {
+          streams.push({
+            url: streamUrl,
+            mime: request.stream.mime || "video/mp4",
+            quality: request.stream.quality || "720p HD",
+            audioUrl: request.stream.audioUrl || null,
+            codecs: request.stream.codecs || null,
+            timestamp: Date.now()
+          });
+          saveTabStreams(tabId, streams);
+
+          chrome.tabs.sendMessage(tabId, {
+            type: "STREAM_REGISTRY_UPDATED",
+            streams: streams
+          }, { frameId: 0 }).catch(() => {});
+        }
+      });
+    }
+    return;
+  }
+
+  // User clicked a download row in the Floating Bar UI
+  if (request.type === "START_VIDEO_DOWNLOAD" || request.type === "MEDIA_SNIFFED_DOWNLOAD") {
+    const referer = sender.tab ? sender.tab.url : "";
     sendToIllusion({
       url: request.url,
       filename: request.filename || "",
-      referer: sender.tab ? sender.tab.url : "",
+      referer: referer,
       audio_url: request.audio_url || null
     }).then(() => {
       sendResponse({ status: "success" });
+    });
+    return true;
+  }
+
+  if (request.type === "GET_TAB_STREAMS") {
+    getTabStreams(tabId).then((list) => {
+      sendResponse({ streams: list });
     });
     return true;
   }
@@ -325,14 +471,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       type: "popup",
       width: 720,
       height: 560
-    });
-    return true;
-  }
-
-  if (request.type === "GET_TAB_STREAMS") {
-    const tabId = sender.tab ? sender.tab.id : -1;
-    getTabStreams(tabId).then((list) => {
-      sendResponse({ streams: list });
     });
     return true;
   }
