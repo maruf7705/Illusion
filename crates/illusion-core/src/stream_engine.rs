@@ -25,6 +25,45 @@ pub enum StreamDispatchMode {
 
 pub struct StreamEngine;
 
+pub fn clean_stream_url(raw_url: &str) -> String {
+    if let Ok(mut parsed) = url::Url::parse(raw_url) {
+        let host = parsed.host_str().unwrap_or("").to_lowercase();
+        let path = parsed.path().to_lowercase();
+
+        if host.contains("googlevideo.com") || path.contains("videoplayback") {
+            let pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .filter(|(k, _)| {
+                    !matches!(
+                        k.as_ref(),
+                        "sabr" | "rqh" | "ump" | "len" | "begin" | "range" | "sq" | "segment" | "frag"
+                    )
+                })
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            parsed.set_query(None);
+            for (k, v) in pairs {
+                parsed.query_pairs_mut().append_pair(&k, &v);
+            }
+            return parsed.to_string();
+        }
+
+        if host.contains("fbcdn.net") || host.contains("cdninstagram.com") || host.contains("facebook.com") {
+            let pairs: Vec<(String, String)> = parsed
+                .query_pairs()
+                .filter(|(k, _)| !matches!(k.as_ref(), "bytestart" | "byteend"))
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            parsed.set_query(None);
+            for (k, v) in pairs {
+                parsed.query_pairs_mut().append_pair(&k, &v);
+            }
+            return parsed.to_string();
+        }
+    }
+    raw_url.to_string()
+}
+
 impl StreamEngine {
     pub fn classify_task(task: &DownloadTask) -> StreamDispatchMode {
         let url_lower = task.url.to_lowercase();
@@ -91,7 +130,7 @@ impl StreamEngine {
 
         // Spawn concurrent video download task
         let v_client = client.clone();
-        let v_url = task.url.clone();
+        let v_url = clean_stream_url(&task.url);
         let v_path = video_part.clone();
         let v_headers = headers.clone();
         let v_cancel = cancel_rx.clone();
@@ -102,7 +141,7 @@ impl StreamEngine {
 
         // Spawn concurrent audio download task
         let a_client = client.clone();
-        let a_url = audio_url.clone();
+        let a_url = clean_stream_url(audio_url);
         let a_path = audio_part.clone();
         let a_headers = headers.clone();
         let a_cancel = cancel_rx.clone();
@@ -173,6 +212,13 @@ impl StreamEngine {
             .await
             .map_err(|e| anyhow!("Audio download task panicked: {}", e))??;
 
+        if v_res == 0 {
+            return Err(anyhow!("Video stream downloaded 0 bytes - download aborted"));
+        }
+        if a_res == 0 {
+            return Err(anyhow!("Audio stream downloaded 0 bytes - download aborted"));
+        }
+
         info!(
             "⚡ StreamEngine: Dual streams retrieved successfully: Video = {} bytes, Audio = {} bytes",
             v_res, a_res
@@ -183,6 +229,10 @@ impl StreamEngine {
         crate::muxer::mux_video_and_audio(&video_part, &audio_part, &task.save_path).await?;
 
         let meta = tokio::fs::metadata(&task.save_path).await?;
+        if meta.len() == 0 {
+            return Err(anyhow!("Assembled media container has 0 bytes - aborting completion"));
+        }
+
         {
             let mut list = state.tasks.write().unwrap();
             if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
@@ -385,20 +435,35 @@ async fn download_single_track(
     progress_tx: tokio::sync::mpsc::Sender<(bool, u64, Option<u64>)>,
     is_video: bool,
 ) -> Result<u64> {
+    let clean_url = clean_stream_url(&url);
+    let is_googlevideo = clean_url.contains("googlevideo.com") || clean_url.contains("videoplayback");
+
     // Check existing bytes for resumption (IDM-grade stream recovery)
     let existing_len = tokio::fs::metadata(&save_path)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
 
-    if existing_len > 0 {
-        if let Ok(range_val) = reqwest::header::HeaderValue::from_str(&format!("bytes={}-", existing_len)) {
-            headers.insert(reqwest::header::RANGE, range_val);
+    // IDM Standard: Media streaming endpoints (like YouTube GVS CDN) STRICTLY require Range header!
+    // A bare GET without Range triggers 403 Forbidden with application/vnd.yt-ump.
+    let range_header = if existing_len > 0 {
+        format!("bytes={}-", existing_len)
+    } else {
+        "bytes=0-".to_string()
+    };
+    if let Ok(range_val) = reqwest::header::HeaderValue::from_str(&range_header) {
+        headers.insert(reqwest::header::RANGE, range_val);
+    }
+
+    // IDM sends Referer: https://www.youtube.com/ for googlevideo streams, but does not force Origin
+    if is_googlevideo && !headers.contains_key(reqwest::header::REFERER) {
+        if let Ok(val) = reqwest::header::HeaderValue::from_str("https://www.youtube.com/") {
+            headers.insert(reqwest::header::REFERER, val);
         }
     }
 
     let mut resp = client
-        .get(&url)
+        .get(&clean_url)
         .headers(headers)
         .send()
         .await
@@ -410,6 +475,16 @@ async fn download_single_track(
             "Stream HTTP request returned error status: {}",
             status
         ));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if content_type.contains("application/vnd.yt-ump") {
+        return Err(anyhow!("Stream request returned UMP protocol error"));
     }
 
     let is_resume_ok = existing_len > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
@@ -469,5 +544,8 @@ async fn download_single_track(
     }
 
     file.flush().await?;
+    if downloaded < 1024 {
+        return Err(anyhow!("Stream track download completed with only {} bytes (invalid or error payload)", downloaded));
+    }
     Ok(downloaded)
 }

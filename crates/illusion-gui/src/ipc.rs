@@ -145,7 +145,8 @@ pub fn start_ipc_server(
                                         return;
                                     }
 
-                                    if let Some(url) = req.url {
+                                    if let Some(raw_url) = req.url {
+                                        let url = illusion_core::prober::clean_media_url(&raw_url);
                                         let mut filename = req.filename.unwrap_or_default();
                                         if filename.is_empty() {
                                             filename = url.split('/').last().unwrap_or("download").to_string();
@@ -167,7 +168,7 @@ pub fn start_ipc_server(
                                             req.cookies,
                                             req.user_agent,
                                         );
-                                        task.audio_url = req.audio_url;
+                                        task.audio_url = req.audio_url.map(|a| illusion_core::prober::clean_media_url(&a));
                                         task.quality = req.quality;
 
                                         let task_id = task.id.clone();
@@ -338,7 +339,8 @@ async fn handle_http_client(
         }
 
         if let Ok(req) = serde_json::from_slice::<IpcDownloadRequest>(&body_bytes) {
-            if let Some(url) = req.url {
+            if let Some(raw_url) = req.url {
+                let url = illusion_core::prober::clean_media_url(&raw_url);
                 let mut filename = req.filename.unwrap_or_default();
                 if filename.is_empty() {
                     filename = url.split('/').last().unwrap_or("download").to_string();
@@ -360,7 +362,7 @@ async fn handle_http_client(
                     req.cookies,
                     req.user_agent,
                 );
-                task.audio_url = req.audio_url;
+                task.audio_url = req.audio_url.map(|a| illusion_core::prober::clean_media_url(&a));
                 task.quality = req.quality;
 
                 let task_id = task.id.clone();

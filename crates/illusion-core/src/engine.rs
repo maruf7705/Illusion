@@ -97,6 +97,8 @@ impl DownloadEngine {
 
         info!("Starting download for task: {} ({})", task.filename, task.url);
 
+        let task_url = crate::prober::clean_media_url(&task.url);
+
         // Update task status to Downloading
         {
             let mut list = state.tasks.write().unwrap();
@@ -153,7 +155,7 @@ impl DownloadEngine {
             _ = cancel_rx.changed() => {
                 return Err(anyhow!("Cancelled"));
             }
-            res = probe_url(&self.client, &task.url, Some(&task.headers), Some(&task.filename)) => {
+            res = probe_url(&self.client, &task_url, Some(&task.headers), Some(&task.filename)) => {
                 res.map_err(|e| format!("Probe failed: {:#}", e))
             }
         };
@@ -195,9 +197,9 @@ impl DownloadEngine {
         let storage = DiskStorage::create_or_open(&task.save_path, total_size).await?;
 
         let res = if accept_ranges && total_size.is_some() && total_size.unwrap() > 0 {
-            self.download_multisegment(
+            match self.download_multisegment(
                 &task_id,
-                &task.url,
+                &task_url,
                 total_size.unwrap(),
                 &task.headers,
                 task.cookies.as_deref(),
@@ -206,11 +208,27 @@ impl DownloadEngine {
                 state.clone(),
                 &mut cancel_rx,
             )
-            .await
+            .await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    warn!("Multisegment download failed ({:#}), falling back to single stream", e);
+                    self.download_single_stream(
+                        &task_id,
+                        &task_url,
+                        &task.headers,
+                        task.cookies.as_deref(),
+                        user_agent.as_deref(),
+                        storage.clone(),
+                        state.clone(),
+                        &mut cancel_rx,
+                    )
+                    .await
+                }
+            }
         } else {
             self.download_single_stream(
                 &task_id,
-                &task.url,
+                &task_url,
                 &task.headers,
                 task.cookies.as_deref(),
                 user_agent.as_deref(),
@@ -668,17 +686,31 @@ async fn run_segment_worker(
             }
         }
 
-        let resp = match client.get(&url).headers(req_headers).send().await {
-            Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT || (current == 0 && r.status() == reqwest::StatusCode::OK) => r,
-            Ok(r) => {
-                warn!("Segment {} HTTP status {} unexpected for range request", seg_id, r.status());
-                sleep(Duration::from_millis(500)).await;
-                continue;
+        let mut retry_count = 0;
+        let resp = loop {
+            if retry_count >= 3 {
+                return Err(anyhow!("Segment {} failed after 3 attempts", seg_id));
             }
-            Err(e) => {
-                warn!("Segment {} request error: {:#}", seg_id, e);
-                sleep(Duration::from_millis(500)).await;
-                continue;
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            match client.get(&url).headers(req_headers.clone()).send().await {
+                Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT || (current == 0 && r.status() == reqwest::StatusCode::OK) => break r,
+                Ok(r) if r.status() == reqwest::StatusCode::OK && current > 0 => {
+                    // Server does not support byte-range slicing (returned 200 OK for sub-range)
+                    return Err(anyhow!("Server does not support byte ranges (returned 200 OK)"));
+                }
+                Ok(r) => {
+                    warn!("Segment {} HTTP status {} unexpected for range request", seg_id, r.status());
+                    retry_count += 1;
+                    sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    warn!("Segment {} request error: {:#}", seg_id, e);
+                    retry_count += 1;
+                    sleep(Duration::from_millis(500)).await;
+                }
             }
         };
 

@@ -21,6 +21,11 @@
       u.searchParams.delete("sq");
       u.searchParams.delete("segment");
       u.searchParams.delete("frag");
+      u.searchParams.delete("sabr");
+      u.searchParams.delete("rqh");
+      u.searchParams.delete("ump");
+      u.searchParams.delete("len");
+      u.searchParams.delete("begin");
       return u.toString();
     } catch (_) {}
     return url;

@@ -409,13 +409,24 @@ async function sendToIllusion(details) {
     let cookiesStr = "";
     try {
       const urlObj = new URL(details.url);
-      const cookies = await chrome.cookies.getAll({ domain: urlObj.hostname });
+      let targetDomain = urlObj.hostname;
+      if (details.referer) {
+        try { targetDomain = new URL(details.referer).hostname; } catch (_) {}
+      }
+      if (targetDomain.includes("googlevideo.com")) {
+        targetDomain = "youtube.com";
+      }
+      const rootDomain = targetDomain.split(".").slice(-2).join(".");
+      const cookies = await chrome.cookies.getAll({ domain: rootDomain });
       cookiesStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
     } catch (_) {}
 
     // Merge cached ring buffer headers if present
     const ringData = getFromRingBuffer(details.url) || {};
     const mergedHeaders = Object.assign({}, ringData.headers || {}, details.headers || {});
+    if (cookiesStr && !mergedHeaders.cookie) {
+      mergedHeaders.cookie = cookiesStr;
+    }
 
     const payload = {
       action: "add_download",

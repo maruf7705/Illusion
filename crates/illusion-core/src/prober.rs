@@ -3,6 +3,53 @@ use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_RANGES, CONTENT_DISPOSITION
 use std::collections::HashMap;
 use url::Url;
 
+/// IDM-Grade Media URL Sanitizer:
+/// Strips subsegment chunk bounds (`bytestart`, `byteend`, `range`, `sq`, `segment`)
+/// so that multi-segment parallel HTTP Range requests can download the entire file.
+/// CRITICAL: Preserves all HMAC parameters signed in `sparams` (e.g. YouTube GoogleVideo).
+pub fn clean_media_url(raw_url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(raw_url) {
+        let is_gvs = parsed.host_str().map_or(false, |h| h.contains("googlevideo.com"));
+        let sparams = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "sparams")
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        let sparams_list: Vec<&str> = sparams.split(',').collect();
+
+        let pairs: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        parsed.query_pairs_mut().clear();
+
+        for (k, v) in pairs {
+            let key = k.as_str();
+            // 1. Never delete parameters signed by Google Video HMAC
+            if is_gvs && sparams_list.contains(&key) {
+                parsed.query_pairs_mut().append_pair(&k, &v);
+                continue;
+            }
+
+            // 2. Facebook / DASH chunk range stripping
+            if key == "bytestart" || key == "byteend" {
+                continue;
+            }
+
+            // 3. Media streaming subsegment chunk params and SABR/UMP params
+            if key == "range" || key == "sq" || key == "frag" || key == "segment"
+                || key == "sabr" || key == "rqh" || key == "ump" || key == "len" || key == "begin" {
+                continue;
+            }
+
+            parsed.query_pairs_mut().append_pair(&k, &v);
+        }
+
+        return parsed.to_string();
+    }
+    raw_url.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteInfo {
     pub url: String,
@@ -20,7 +67,8 @@ pub async fn probe_url(
     extra_headers: Option<&HashMap<String, String>>,
     suggested_filename: Option<&str>,
 ) -> Result<RemoteInfo> {
-    let parsed_url = Url::parse(url_str)?;
+    let clean_url = clean_media_url(url_str);
+    let parsed_url = Url::parse(&clean_url)?;
     let mut custom_headers = HeaderMap::new();
 
     if let Some(headers) = extra_headers {
@@ -46,19 +94,13 @@ pub async fn probe_url(
                 HeaderValue::from_static("https://www.youtube.com/"),
             );
         }
-        if !custom_headers.contains_key(reqwest::header::ORIGIN) {
-            custom_headers.insert(
-                reqwest::header::ORIGIN,
-                HeaderValue::from_static("https://www.youtube.com"),
-            );
-        }
     }
 
     // Try HEAD request first (skip for googlevideo/streaming CDNs which reject HEAD with 403)
     let resp = if is_googlevideo {
         None
     } else {
-        let head_req = client.head(url_str).headers(custom_headers.clone());
+        let head_req = client.head(&clean_url).headers(custom_headers.clone());
         head_req.send().await.ok()
     };
 
@@ -128,7 +170,7 @@ pub async fn probe_url(
         let mut probe_headers = custom_headers.clone();
         probe_headers.insert(RANGE, HeaderValue::from_static("bytes=0-0"));
 
-        let get_resp = client.get(url_str).headers(probe_headers).send().await?;
+        let get_resp = client.get(&clean_url).headers(probe_headers).send().await?;
         let status = get_resp.status();
         let headers = get_resp.headers();
 
@@ -192,7 +234,7 @@ pub async fn probe_url(
     };
 
     Ok(RemoteInfo {
-        url: url_str.to_string(),
+        url: clean_url,
         filename: final_filename,
         total_size,
         accept_ranges,

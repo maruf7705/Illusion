@@ -13,14 +13,13 @@
     if (!url || typeof url !== "string") return "";
     try {
       const u = new URL(url);
-      u.searchParams.delete("bytestart");
-      u.searchParams.delete("byteend");
-      u.searchParams.delete("range");
-      u.searchParams.delete("rn");
-      u.searchParams.delete("alr");
-      u.searchParams.delete("sq");
-      u.searchParams.delete("segment");
-      u.searchParams.delete("frag");
+      const sparams = (u.searchParams.get("sparams") || "").split(",");
+      // CRITICAL: Never strip parameters that are signed by Google Video sparams HMAC!
+      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag"].forEach((p) => {
+        if (!sparams.includes(p)) {
+          u.searchParams.delete(p);
+        }
+      });
       return u.toString();
     } catch (_) {}
     return url;

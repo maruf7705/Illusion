@@ -29,6 +29,11 @@
       u.searchParams.delete("sq");
       u.searchParams.delete("segment");
       u.searchParams.delete("frag");
+      u.searchParams.delete("sabr");
+      u.searchParams.delete("rqh");
+      u.searchParams.delete("ump");
+      u.searchParams.delete("len");
+      u.searchParams.delete("begin");
       return u.toString();
     } catch (_) {
       return url;
@@ -43,27 +48,20 @@
       stream.audioUrl = cleanMediaUrl(stream.audioUrl);
     }
 
-    let itag = null;
-    try {
-      itag = new URL(url).searchParams.get("itag");
-    } catch (_) {}
-
-    const quality = (stream.quality || "").toLowerCase();
-    const isAudio = (stream.mime || "").includes("audio") || quality.includes("audio");
+    let itag = stream.itag || null;
+    if (!itag) {
+      try {
+        itag = new URL(url).searchParams.get("itag");
+      } catch (_) {}
+    }
+    if (itag) {
+      stream.itag = itag.toString();
+    }
 
     const idx = currentStreams.findIndex((s) => {
       if (s.url === url) return true;
-      if (itag) {
-        try {
-          if (new URL(s.url).searchParams.get("itag") === itag) return true;
-        } catch (_) {}
-      }
-      const sIsAudio = (s.mime || "").includes("audio") || (s.quality || "").toLowerCase().includes("audio");
-      if (sIsAudio === isAudio) {
-        // Enforce IDM-grade quality tier uniqueness: only 1 entry per resolution tier per video
-        if (s.quality && stream.quality && s.quality.toLowerCase() === stream.quality.toLowerCase()) {
-          return true;
-        }
+      if (itag && s.itag && s.itag.toString() === itag.toString()) {
+        return true;
       }
       return false;
     });
@@ -117,8 +115,23 @@
         pageStreams.forEach((s) => addStream(s));
       }
 
-      // Direct read ytInitialPlayerResponse from page context
-      const pr = pageWin.ytInitialPlayerResponse;
+      // Direct read ytInitialPlayerResponse or movie_player from page context
+      let pr = null;
+      try {
+        const mp = pageWin.document ? pageWin.document.getElementById("movie_player") : null;
+        if (mp && typeof mp.getPlayerResponse === "function") {
+          pr = mp.getPlayerResponse();
+        }
+      } catch (_) {}
+      if (!pr) {
+        pr = pageWin.ytInitialPlayerResponse;
+      }
+      if (!pr && pageWin.ytplayer && pageWin.ytplayer.config && pageWin.ytplayer.config.args) {
+        try {
+          pr = JSON.parse(pageWin.ytplayer.config.args.raw_player_response || pageWin.ytplayer.config.args.player_response);
+        } catch (_) {}
+      }
+
       if (pr && pr.streamingData) {
         const streaming = pr.streamingData;
         const formats = streaming.formats || [];
@@ -146,6 +159,7 @@
           if (u) {
             addStream({
               url: cleanMediaUrl(u),
+              itag: f.itag ? f.itag.toString() : null,
               quality: f.qualityLabel || `${f.height || 360}p`,
               mime: f.mimeType || "video/mp4",
               size: parseInt(f.contentLength || "0", 10) || 0,
@@ -164,6 +178,7 @@
             const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
             addStream({
               url: cleanMediaUrl(u),
+              itag: f.itag ? f.itag.toString() : null,
               quality: qLabel,
               mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
               size: parseInt(f.contentLength || "0", 10) || 0,
@@ -543,11 +558,28 @@
 
     let displayList = currentStreams.slice();
 
-    // Sort streams like IDM: highest quality/size first, audio tracks at bottom
+    function getResolutionRank(quality) {
+      const q = (quality || "").toLowerCase();
+      if (q.includes("2160") || q.includes("4k")) return 2160;
+      if (q.includes("1440") || q.includes("2k")) return 1440;
+      if (q.includes("1080")) return 1080;
+      if (q.includes("720")) return 720;
+      if (q.includes("480")) return 480;
+      if (q.includes("360")) return 360;
+      if (q.includes("240")) return 240;
+      if (q.includes("144")) return 144;
+      return 0;
+    }
+
+    // Sort streams like IDM: resolution descending, file size descending, audio tracks at bottom
     displayList.sort((a, b) => {
-      const aAudio = (a.mime || "").includes("audio");
-      const bAudio = (b.mime || "").includes("audio");
+      const aAudio = (a.mime || "").includes("audio") || (a.quality || "").toLowerCase().includes("audio");
+      const bAudio = (b.mime || "").includes("audio") || (b.quality || "").toLowerCase().includes("audio");
       if (aAudio !== bAudio) return aAudio ? 1 : -1;
+      if (aAudio && bAudio) return (b.size || 0) - (a.size || 0);
+      const aRank = getResolutionRank(a.quality);
+      const bRank = getResolutionRank(b.quality);
+      if (aRank !== bRank) return bRank - aRank;
       return (b.size || 0) - (a.size || 0);
     });
 
@@ -618,35 +650,52 @@
 
   function formatMediaLabel(stream, index) {
     const url = stream.url || "";
-    let itag = null;
-    try {
-      itag = new URL(url).searchParams.get("itag");
-    } catch (_) {}
+    let itag = stream.itag || null;
+    if (!itag) {
+      try {
+        itag = new URL(url).searchParams.get("itag");
+      } catch (_) {}
+    }
+
+    let sizeStr = "";
+    if (stream.size && stream.size > 0) {
+      if (stream.size > 1024 * 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`;
+      else if (stream.size > 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024)).toFixed(1)} MB)`;
+      else if (stream.size > 1024) sizeStr = ` (${(stream.size / 1024).toFixed(0)} KB)`;
+    }
 
     if (itag) {
       const itagMap = {
+        "248": "WebM file, quality 1080p",
         "137": "MP4 file, quality 1080p HD",
-        "22": "MP4 file, quality 720p HD",
+        "399": "MP4 file, quality 1080p",
+        "247": "WebM file, quality 720p",
         "136": "MP4 file, quality 720p HD",
+        "398": "MP4 file, quality 720p HD",
+        "303": "WebM file, quality 1080p60 HD",
+        "298": "MP4 file, quality 720p60 HD",
+        "244": "WebM file, quality 480p",
         "135": "MP4 file, quality 480p",
-        "18": "MP4 file, quality 360p",
+        "397": "MP4 file, quality 480p",
+        "243": "WebM file, quality 360p",
         "134": "MP4 file, quality 360p",
-        "140": "M4A file, quality Audio 128k",
-        "251": "WebM file, quality Audio 160k",
-        "250": "WebM file, quality Audio 70k",
-        "249": "WebM file, quality Audio 50k",
+        "396": "MP4 file, quality 360p",
+        "242": "WebM file, quality 240p",
+        "133": "MP4 file, quality 240p",
+        "395": "MP4 file, quality 240p",
+        "278": "WebM file, quality 144p",
+        "160": "MP4 file, quality 144p",
+        "394": "MP4 file, quality 144p",
+        "18": "MP4 file, quality 360p",
+        "22": "MP4 file, quality 720p HD",
         "313": "WebM file, quality 2160p 4K",
         "271": "WebM file, quality 1440p 2K",
-        "303": "WebM file, quality 1080p60 HD",
-        "298": "MP4 file, quality 720p60 HD"
+        "251": "WebM file, quality Audio 160k",
+        "140": "M4A file, quality Audio 128k",
+        "250": "WebM file, quality Audio 70k",
+        "249": "WebM file, quality Audio 50k"
       };
       if (itagMap[itag]) {
-        let sizeStr = "";
-        if (stream.size && stream.size > 0) {
-          if (stream.size > 1024 * 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`;
-          else if (stream.size > 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024)).toFixed(1)} MB)`;
-          else if (stream.size > 1024) sizeStr = ` (${(stream.size / 1024).toFixed(0)} KB)`;
-        }
         return `${index + 1}. ${itagMap[itag]}${sizeStr}`;
       }
     }
@@ -661,12 +710,6 @@
     else if (mime.includes("dash") || url.includes(".mpd")) format = "DASH (.mpd)";
 
     let quality = stream.quality || "720p HD";
-    let sizeStr = "";
-    if (stream.size && stream.size > 0) {
-      if (stream.size > 1024 * 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`;
-      else if (stream.size > 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024)).toFixed(1)} MB)`;
-      else if (stream.size > 1024) sizeStr = ` (${(stream.size / 1024).toFixed(0)} KB)`;
-    }
     return `${index + 1}. ${format} file, quality ${quality}${sizeStr}`;
   }
 
