@@ -90,7 +90,7 @@ impl DownloadEngine {
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
         let task = {
-            let list = state.tasks.read().await;
+            let list = state.tasks.read().unwrap();
             list.iter().find(|t| t.id == task_id).cloned()
         }
         .ok_or_else(|| anyhow!("Task {} not found", task_id))?;
@@ -99,22 +99,23 @@ impl DownloadEngine {
 
         // Update task status to Downloading
         {
-            let mut list = state.tasks.write().await;
+            let mut list = state.tasks.write().unwrap();
             if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
                 t.status = TaskStatus::Downloading;
                 t.error_message = None;
             }
         }
 
-        // Multi-Engine Classification: Check if stream requires Extractor or HLS
+        // Multi-Engine Classification: Check if stream requires Dual-Stream Adaptive Muxing or HLS
         let mode = crate::stream_engine::StreamEngine::classify_task(&task);
         match mode {
-            crate::stream_engine::StreamDispatchMode::ExtractorFallback => {
-                return crate::stream_engine::StreamEngine::download_extractor(
+            crate::stream_engine::StreamDispatchMode::SeparatedVideoAudioMux => {
+                return crate::stream_engine::StreamEngine::download_dual_stream(
+                    &self.client,
                     &task_id,
                     &task,
                     state,
-                    cancel_rx,
+                    &mut cancel_rx,
                 )
                 .await;
             }
@@ -128,7 +129,7 @@ impl DownloadEngine {
                 )
                 .await;
             }
-            _ => {}
+            crate::stream_engine::StreamDispatchMode::DirectByteRange => {}
         }
 
         // Probe if total size or range capability unknown
@@ -147,22 +148,26 @@ impl DownloadEngine {
 
         let (total_size, accept_ranges) = match remote_info {
             Ok(info) => {
-                let mut list = state.tasks.write().await;
-                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                    if t.total_size.is_none() {
-                        t.total_size = info.total_size;
-                    }
-                    if t.filename.is_empty() || t.filename == "download" {
-                        t.filename = info.filename.clone();
+                {
+                    let mut list = state.tasks.write().unwrap();
+                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                        if t.total_size.is_none() {
+                            t.total_size = info.total_size;
+                        }
+                        if t.filename.is_empty() || t.filename == "download" {
+                            t.filename = info.filename.clone();
+                        }
                     }
                 }
                 (info.total_size, info.accept_ranges)
             }
             Err(e) => {
-                let mut list = state.tasks.write().await;
-                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                    t.status = TaskStatus::Error;
-                    t.error_message = Some(e.clone());
+                {
+                    let mut list = state.tasks.write().unwrap();
+                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                        t.status = TaskStatus::Error;
+                        t.error_message = Some(e.clone());
+                    }
                 }
                 let _ = state.save_tasks().await;
                 return Err(anyhow!(e));
@@ -241,28 +246,31 @@ impl DownloadEngine {
                 let meta = tokio::fs::metadata(&task.save_path).await.ok();
                 let actual_bytes = meta.map(|m| m.len()).unwrap_or(0);
                 if actual_bytes < 128 {
-                    let mut list = state.tasks.write().await;
-                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                        t.status = TaskStatus::Error;
-                        t.error_message = Some("Downloaded file is empty or corrupted".to_string());
-                        t.speed = 0.0;
+                    {
+                        let mut list = state.tasks.write().unwrap();
+                        if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                            t.status = TaskStatus::Error;
+                            t.error_message = Some("Downloaded file is empty or corrupted".to_string());
+                            t.speed = 0.0;
+                        }
                     }
                     let _ = state.save_tasks().await;
                     return Err(anyhow!("Downloaded file is empty or corrupted ({} bytes)", actual_bytes));
                 }
 
-                let mut list = state.tasks.write().await;
-                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                    t.status = TaskStatus::Completed;
-                    t.speed = 0.0;
-                    t.eta_seconds = None;
-                    t.completed_at = Some(chrono::Utc::now());
-                    t.downloaded_size = actual_bytes;
-                    if t.total_size.is_none() {
-                        t.total_size = Some(actual_bytes);
+                {
+                    let mut list = state.tasks.write().unwrap();
+                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                        t.status = TaskStatus::Completed;
+                        t.speed = 0.0;
+                        t.eta_seconds = None;
+                        t.completed_at = Some(chrono::Utc::now());
+                        t.downloaded_size = actual_bytes;
+                        if t.total_size.is_none() {
+                            t.total_size = Some(actual_bytes);
+                        }
                     }
                 }
-                drop(list);
                 let _ = state.save_tasks().await;
                 info!("Task {} finished successfully! ({} bytes)", task.filename, actual_bytes);
 
@@ -275,22 +283,23 @@ impl DownloadEngine {
             }
             Err(e) => {
                 let is_cancelled = *cancel_rx.borrow();
-                let mut list = state.tasks.write().await;
-                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                    if is_cancelled {
-                        t.status = TaskStatus::Paused;
-                        t.speed = 0.0;
-                        t.eta_seconds = None;
-                        info!("Task {} paused by user.", task.filename);
-                    } else {
-                        t.status = TaskStatus::Error;
-                        t.error_message = Some(e.to_string());
-                        t.speed = 0.0;
-                        t.eta_seconds = None;
-                        error!("Task {} failed: {:#}", task.filename, e);
+                {
+                    let mut list = state.tasks.write().unwrap();
+                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                        if is_cancelled {
+                            t.status = TaskStatus::Paused;
+                            t.speed = 0.0;
+                            t.eta_seconds = None;
+                            info!("Task {} paused by user.", task.filename);
+                        } else {
+                            t.status = TaskStatus::Error;
+                            t.error_message = Some(e.to_string());
+                            t.speed = 0.0;
+                            t.eta_seconds = None;
+                            error!("Task {} failed: {:#}", task.filename, e);
+                        }
                     }
                 }
-                drop(list);
                 let _ = state.save_tasks().await;
             }
         }
@@ -314,7 +323,7 @@ impl DownloadEngine {
 
         // Initialize segments if not present
         {
-            let mut list = state.tasks.write().await;
+            let mut list = state.tasks.write().unwrap();
             if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
                 if t.segments.is_empty() {
                     let chunk_size = total_size / conn_count as u64;
@@ -334,7 +343,7 @@ impl DownloadEngine {
         }
 
         let segments_mutex = Arc::new(Mutex::new({
-            let list = state.tasks.read().await;
+            let list = state.tasks.read().unwrap();
             list.iter()
                 .find(|t| t.id == task_id)
                 .map(|t| t.segments.clone())
@@ -342,7 +351,7 @@ impl DownloadEngine {
         }));
 
         let total_downloaded = Arc::new(AtomicU64::new({
-            let list = state.tasks.read().await;
+            let list = state.tasks.read().unwrap();
             list.iter().find(|t| t.id == task_id).map(|t| t.downloaded_size).unwrap_or(0)
         }));
 
@@ -422,7 +431,7 @@ impl DownloadEngine {
                             let l = segments_mutex.lock().await;
                             l.clone()
                         };
-                        let mut list = state.tasks.write().await;
+                        let mut list = state.tasks.write().unwrap();
                         if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
                             t.downloaded_size = current_bytes;
                             t.speed = speed;
@@ -569,17 +578,19 @@ impl DownloadEngine {
                 last_instant = now;
                 last_bytes = downloaded;
 
-                let mut list = state.tasks.write().await;
-                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                    t.downloaded_size = downloaded;
-                    t.speed = speed;
+                {
+                    let mut list = state.tasks.write().unwrap();
+                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                        t.downloaded_size = downloaded;
+                        t.speed = speed;
+                    }
                 }
             }
         }
 
         // Always update total downloaded size at end
         {
-            let mut list = state.tasks.write().await;
+            let mut list = state.tasks.write().unwrap();
             if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
                 t.downloaded_size = downloaded;
             }

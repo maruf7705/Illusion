@@ -8,8 +8,13 @@ use std::process::Command;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+fn default_action() -> String {
+    "add_download".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct NativeMessage {
+    #[serde(default = "default_action")]
     action: String,
     url: Option<String>,
     filename: Option<String>,
@@ -17,6 +22,7 @@ struct NativeMessage {
     cookies: Option<String>,
     user_agent: Option<String>,
     audio_url: Option<String>,
+    quality: Option<String>,
     headers: Option<HashMap<String, String>>,
 }
 
@@ -142,11 +148,17 @@ async fn main() -> Result<()> {
                         msg.user_agent,
                     );
                     task.audio_url = msg.audio_url;
+                    task.quality = msg.quality;
                     let task_id = task.id.clone();
                     state.add_task(task).await;
 
                     // Spawn GUI if not already open with decoupled stdio so Chromium pipe never hangs
-                    let _ = Command::new("illusion")
+                    let exe_path = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|dir| dir.join("illusion")))
+                        .unwrap_or_else(|| PathBuf::from("illusion"));
+
+                    let _ = Command::new(exe_path)
                         .stdin(std::process::Stdio::null())
                         .stdout(std::process::Stdio::null())
                         .stderr(std::process::Stdio::null())

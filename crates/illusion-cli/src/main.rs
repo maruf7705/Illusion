@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
             let _ = monitor_handle.await;
         }
         "list" => {
-            let tasks = state.tasks.read().await;
+            let tasks = state.tasks.read().unwrap();
             if tasks.is_empty() {
                 println!("No downloads found in Illusion.");
                 return Ok(());

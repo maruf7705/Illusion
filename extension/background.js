@@ -385,6 +385,7 @@ async function sendToIllusion(details) {
       cookies: cookiesStr || ringData.headers?.cookie || "",
       user_agent: navigator.userAgent,
       audio_url: details.audio_url || null,
+      quality: details.quality || "",
       headers: mergedHeaders
     };
 

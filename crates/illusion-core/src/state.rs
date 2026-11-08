@@ -3,8 +3,7 @@ use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone)]
 pub struct AppState {
@@ -46,8 +45,10 @@ impl AppState {
     }
 
     pub async fn save_tasks(&self) -> Result<()> {
-        let tasks = self.tasks.read().await;
-        let data = serde_json::to_string_pretty(&*tasks).context("Failed to serialize tasks")?;
+        let data = {
+            let tasks = self.tasks.read().unwrap();
+            serde_json::to_string_pretty(&*tasks).context("Failed to serialize tasks")?
+        };
         let tasks_file = self.config_dir.join("tasks.json");
         tokio::fs::write(&tasks_file, data)
             .await
@@ -56,21 +57,27 @@ impl AppState {
     }
 
     pub async fn add_task(&self, task: DownloadTask) {
-        let mut list = self.tasks.write().await;
-        list.insert(0, task);
-        drop(list);
+        {
+            let mut list = self.tasks.write().unwrap();
+            list.insert(0, task);
+        }
         let _ = self.save_tasks().await;
     }
 
-    pub async fn get_task(&self, id: &str) -> Option<DownloadTask> {
-        let list = self.tasks.read().await;
+    pub fn get_task_sync(&self, id: &str) -> Option<DownloadTask> {
+        let list = self.tasks.read().unwrap();
         list.iter().find(|t| t.id == id).cloned()
     }
 
+    pub async fn get_task(&self, id: &str) -> Option<DownloadTask> {
+        self.get_task_sync(id)
+    }
+
     pub async fn remove_task(&self, id: &str) {
-        let mut list = self.tasks.write().await;
-        list.retain(|t| t.id != id);
-        drop(list);
+        {
+            let mut list = self.tasks.write().unwrap();
+            list.retain(|t| t.id != id);
+        }
         let _ = self.save_tasks().await;
     }
 }

@@ -25,6 +25,13 @@
     return true;
   }
 
+  function safeSendMessage(payload) {
+    if (typeof chrome === "undefined" || !chrome.runtime?.id) return;
+    try {
+      chrome.runtime.sendMessage(payload).catch(() => {});
+    } catch (_) {}
+  }
+
   function reportVideoElement(el) {
     if (!isValidMedia(el)) return;
     detectedMediaElements.add(el);
@@ -48,9 +55,7 @@
       isAudio: el.tagName.toLowerCase() === "audio"
     };
 
-    try {
-      chrome.runtime.sendMessage(payload).catch(() => {});
-    } catch (_) {}
+    safeSendMessage(payload);
   }
 
   // 1. Scan DOM for Media Elements
@@ -105,10 +110,10 @@
   // 3. Listen to CustomEvents and cross-world postMessages from Main-World Hook
   function onDiscoveredStream(detail) {
     if (detail && detail.url) {
-      chrome.runtime.sendMessage({
+      safeSendMessage({
         type: "ILLUSION_STREAM_DISCOVERED",
         stream: detail
-      }).catch(() => {});
+      });
     }
   }
 
@@ -124,10 +129,10 @@
 
   window.addEventListener("__ILLUSION_MSE_DETECTED__", (e) => {
     if (e.detail) {
-      chrome.runtime.sendMessage({
+      safeSendMessage({
         type: "ILLUSION_MSE_DETECTED",
         detail: e.detail
-      }).catch(() => {});
+      });
     }
   });
 
@@ -138,5 +143,11 @@
     scanForMedia();
   }
 
-  setInterval(scanForMedia, 2000);
+  const scanInterval = setInterval(() => {
+    if (typeof chrome === "undefined" || !chrome.runtime?.id) {
+      clearInterval(scanInterval);
+      return;
+    }
+    scanForMedia();
+  }, 2000);
 })();

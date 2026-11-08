@@ -41,6 +41,29 @@
   };
 
   let lastActivePlaybackUrl = null;
+  const liveItagUrls = new Map();
+  let lastActiveAudioUrl = null;
+  let lastActiveVideoUrl = null;
+
+  function trackPlaybackUrl(url) {
+    if (!url || typeof url !== "string") return;
+    try {
+      const u = new URL(url);
+      if (u.pathname.includes("videoplayback") || u.hostname.includes("googlevideo.com")) {
+        const itag = u.searchParams.get("itag");
+        const cleaned = cleanUrl(url);
+        if (itag) {
+          liveItagUrls.set(itag, cleaned);
+          if (["140", "251", "250", "249"].includes(itag)) {
+            lastActiveAudioUrl = cleaned;
+          } else {
+            lastActiveVideoUrl = cleaned;
+          }
+        }
+        lastActivePlaybackUrl = cleaned;
+      }
+    } catch (_) {}
+  }
 
   function emitMediaDiscovery(detail) {
     if (!detail || !detail.url) return;
@@ -136,7 +159,7 @@
       const url = typeof resource === "string" ? resource : (resource && resource.url ? resource.url : "");
       if (url) {
         if (url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback")) {
-          lastActivePlaybackUrl = url;
+          trackPlaybackUrl(url);
           inspectGlobalPlayerState(url);
         } else if (url.match(/\.(mp4|webm|m3u8|mpd|m4s|mp3|m4a|wav|ts)(\?|$)/i)) {
           emitMediaDiscovery({ url });
@@ -153,7 +176,7 @@
       const url = args[1];
       if (url && typeof url === "string") {
         if (url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback")) {
-          lastActivePlaybackUrl = url;
+          trackPlaybackUrl(url);
           inspectGlobalPlayerState(url);
         } else if (url.match(/\.(mp4|webm|m3u8|mpd|m4s|mp3|m4a|wav|ts)(\?|$)/i)) {
           emitMediaDiscovery({ url });
@@ -201,82 +224,54 @@
       const adaptive = streaming.adaptiveFormats || [];
       const activeUrl = overrideUrl || lastActivePlaybackUrl;
 
-      // Find best audio URL or construct it
-      let bestAudioUrl = null;
-      for (const fmt of adaptive) {
-        if (fmt.mimeType && fmt.mimeType.includes("audio")) {
-          if (fmt.url) {
-            bestAudioUrl = fmt.url;
-            break;
-          } else if (activeUrl) {
-            try {
-              const u = new URL(activeUrl);
-              u.searchParams.set("itag", fmt.itag.toString());
-              u.searchParams.delete("range");
-              u.searchParams.delete("rn");
-              u.searchParams.delete("alr");
-              bestAudioUrl = u.toString();
-              break;
-            } catch (_) {}
-          } else {
-            bestAudioUrl = `${window.location.origin}/videoplayback?itag=${fmt.itag}`;
+      // Find best audio URL from live intercepted requests or direct format URLs
+      let bestAudioUrl = lastActiveAudioUrl || liveItagUrls.get("140") || liveItagUrls.get("251");
+      if (!bestAudioUrl) {
+        for (const fmt of adaptive) {
+          if (fmt.mimeType && fmt.mimeType.includes("audio") && fmt.url) {
+            bestAudioUrl = cleanUrl(fmt.url);
             break;
           }
         }
       }
 
-      // 1. Process regular muxed formats
+      // 1. Process regular muxed formats (e.g. 360p, 720p with combined audio)
       formats.forEach((f) => {
-        let streamUrl = f.url;
-        if (!streamUrl && activeUrl) {
-          try {
-            const u = new URL(activeUrl);
-            u.searchParams.set("itag", f.itag.toString());
-            u.searchParams.delete("range");
-            u.searchParams.delete("rn");
-            u.searchParams.delete("alr");
-            streamUrl = u.toString();
-          } catch (_) {}
+        let streamUrl = f.url || liveItagUrls.get(f.itag?.toString());
+        if (streamUrl) {
+          emitMediaDiscovery({
+            url: cleanUrl(streamUrl),
+            quality: f.qualityLabel || `${f.height || 360}p`,
+            mime: f.mimeType || "video/mp4",
+            size: parseInt(f.contentLength || "0", 10) || 0,
+            audioUrl: null
+          });
         }
-        if (!streamUrl) {
-          streamUrl = `${window.location.origin}/videoplayback?itag=${f.itag}`;
-        }
-
-        emitMediaDiscovery({
-          url: streamUrl,
-          quality: f.qualityLabel || `${f.height || 360}p`,
-          mime: f.mimeType || "video/mp4",
-          size: parseInt(f.contentLength || "0", 10) || 0,
-          audioUrl: null
-        });
       });
 
       // 2. Process adaptive video & audio formats
       adaptive.forEach((f) => {
-        let streamUrl = f.url;
+        const isAudio = f.mimeType && f.mimeType.includes("audio");
+        let streamUrl = f.url || liveItagUrls.get(f.itag?.toString());
         if (!streamUrl && activeUrl) {
           try {
             const u = new URL(activeUrl);
-            u.searchParams.set("itag", f.itag.toString());
-            u.searchParams.delete("range");
-            u.searchParams.delete("rn");
-            u.searchParams.delete("alr");
-            streamUrl = u.toString();
+            if (u.searchParams.get("itag") === f.itag?.toString()) {
+              streamUrl = cleanUrl(activeUrl);
+            }
           } catch (_) {}
         }
-        if (!streamUrl) {
-          streamUrl = `${window.location.origin}/videoplayback?itag=${f.itag}`;
-        }
 
-        const isAudio = f.mimeType && f.mimeType.includes("audio");
-        const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
-        emitMediaDiscovery({
-          url: streamUrl,
-          quality: qLabel,
-          mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
-          size: parseInt(f.contentLength || "0", 10) || 0,
-          audioUrl: isAudio ? null : bestAudioUrl
-        });
+        if (streamUrl) {
+          const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
+          emitMediaDiscovery({
+            url: cleanUrl(streamUrl),
+            quality: qLabel,
+            mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
+            size: parseInt(f.contentLength || "0", 10) || 0,
+            audioUrl: isAudio ? null : bestAudioUrl
+          });
+        }
       });
     } catch (_) {}
   }

@@ -11,8 +11,13 @@ use tracing::{error, info, warn};
 
 pub const HTTP_BRIDGE_PORT: u16 = 9095;
 
+fn default_action() -> String {
+    "add_download".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcDownloadRequest {
+    #[serde(default = "default_action")]
     pub action: String,
     pub url: Option<String>,
     pub filename: Option<String>,
@@ -20,6 +25,7 @@ pub struct IpcDownloadRequest {
     pub cookies: Option<String>,
     pub user_agent: Option<String>,
     pub audio_url: Option<String>,
+    pub quality: Option<String>,
     pub headers: Option<HashMap<String, String>>,
 }
 
@@ -113,6 +119,7 @@ pub fn start_ipc_server(
                                             req.user_agent,
                                         );
                                         task.audio_url = req.audio_url;
+                                        task.quality = req.quality;
 
                                         let task_id = task.id.clone();
                                         state.add_task(task).await;
@@ -303,6 +310,7 @@ async fn handle_http_client(
                     req.user_agent,
                 );
                 task.audio_url = req.audio_url;
+                task.quality = req.quality;
 
                 let task_id = task.id.clone();
                 state.add_task(task).await;

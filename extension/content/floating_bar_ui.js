@@ -240,7 +240,11 @@
     // Help button
     helpBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      chrome.runtime.sendMessage({ type: "OPEN_HELP" });
+      if (typeof chrome !== "undefined" && chrome.runtime?.id) {
+        try {
+          chrome.runtime.sendMessage({ type: "OPEN_HELP" });
+        } catch (_) {}
+      }
     });
 
     // Download All
@@ -440,20 +444,77 @@
     return `${index + 1}. ${format} file, quality ${quality}${sizeStr}`;
   }
 
-  function triggerDownload(stream) {
+  function showFeedback(text) {
+    if (!barContainer) return;
+    const titleEl = barContainer.querySelector(".idm-title-text");
+    if (!titleEl) return;
+    const origText = titleEl.innerText;
+    titleEl.innerText = text;
+    titleEl.style.color = "#1ba829";
+    setTimeout(() => {
+      if (titleEl) {
+        titleEl.innerText = origText;
+        titleEl.style.color = "";
+      }
+    }, 2500);
+  }
+
+  async function triggerDownload(stream) {
     if (!stream || !stream.url) return;
     const title = (document.title || "video").replace(" - YouTube", "").trim();
     const ext = stream.mime && stream.mime.includes("audio") ? ".m4a" : ".mp4";
     const filename = title.replace(/[^a-zA-Z0-9_\-\. ]/g, "_").trim() + ext;
 
-    chrome.runtime.sendMessage({
-      type: "START_VIDEO_DOWNLOAD",
+    const payload = {
+      action: "add_download",
       url: stream.url,
       filename: filename,
+      referer: window.location.href,
       audio_url: stream.audioUrl || null,
-      page_url: window.location.href,
-      quality: stream.quality || ""
-    });
+      quality: stream.quality || "",
+      headers: {
+        Referer: window.location.href,
+        "User-Agent": navigator.userAgent
+      }
+    };
+
+    let dispatched = false;
+
+    // 1. Try Extension Runtime Message Bus
+    if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
+      try {
+        chrome.runtime.sendMessage({
+          type: "START_VIDEO_DOWNLOAD",
+          url: stream.url,
+          filename: filename,
+          audio_url: stream.audioUrl || null,
+          page_url: window.location.href,
+          quality: stream.quality || ""
+        }, () => {
+          if (!chrome.runtime.lastError) {
+            dispatched = true;
+          }
+        });
+        dispatched = true;
+      } catch (e) {
+        console.warn("[Illusion] Extension runtime message failed:", e);
+      }
+    }
+
+    // 2. Direct HTTP Bridge Fallback (127.0.0.1:9095)
+    // Ensures download triggers even if extension was reloaded or context was invalidated!
+    try {
+      const resp = await fetch("http://127.0.0.1:9095/add_download", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (resp.ok) {
+        dispatched = true;
+      }
+    } catch (_) {}
+
+    showFeedback("✓ Queued to Illusion!");
   }
 
   function positionOverVideo(rect) {
@@ -536,23 +597,29 @@
     }
   }
 
-  // Request already detected streams from background
-  try {
-    chrome.runtime.sendMessage({ type: "GET_TAB_STREAMS" }, (resp) => {
-      if (resp && Array.isArray(resp.streams) && resp.streams.length > 0) {
-        currentStreams = resp.streams;
-        if (barContainer) {
-          const badge = barContainer.querySelector("#illusion-stream-count");
-          if (badge && currentStreams.length > 1) {
-            badge.style.display = "inline-block";
-            badge.innerText = currentStreams.length.toString();
+  // Request already detected streams from background safely
+  if (typeof chrome !== "undefined" && chrome.runtime?.id) {
+    try {
+      chrome.runtime.sendMessage({ type: "GET_TAB_STREAMS" }, (resp) => {
+        if (!chrome.runtime?.id || chrome.runtime.lastError) return;
+        if (resp && Array.isArray(resp.streams) && resp.streams.length > 0) {
+          currentStreams = resp.streams;
+          if (barContainer) {
+            const badge = barContainer.querySelector("#illusion-stream-count");
+            if (badge && currentStreams.length > 1) {
+              badge.style.display = "inline-block";
+              badge.innerText = currentStreams.length.toString();
+            }
           }
         }
-      }
-    });
-  } catch (_) {}
+      });
+    } catch (_) {}
+  }
 
-  setInterval(checkTopVideo, 1500);
+  const topVideoInterval = setInterval(() => {
+    checkTopVideo();
+  }, 1500);
+
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", checkTopVideo);
   } else {

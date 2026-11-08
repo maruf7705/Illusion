@@ -79,6 +79,19 @@ impl DownloadCategory {
             DownloadCategory::Misc => "📁",
         }
     }
+
+    pub fn accent_color(&self) -> (u8, u8, u8) {
+        match self {
+            DownloadCategory::All => (205, 214, 244),
+            DownloadCategory::Compressed => (249, 226, 175),
+            DownloadCategory::Programs => (203, 166, 247),
+            DownloadCategory::Video => (137, 180, 250),
+            DownloadCategory::Music => (245, 194, 231),
+            DownloadCategory::Documents => (250, 179, 135),
+            DownloadCategory::Images => (166, 227, 161),
+            DownloadCategory::Misc => (180, 190, 254),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +114,7 @@ pub struct DownloadTask {
     pub cookies: Option<String>,
     pub user_agent: Option<String>,
     pub audio_url: Option<String>,
+    pub quality: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -133,6 +147,7 @@ impl DownloadTask {
             cookies,
             user_agent,
             audio_url: None,
+            quality: None,
             created_at: Utc::now(),
             completed_at: None,
         }

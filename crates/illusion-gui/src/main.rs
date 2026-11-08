@@ -7,7 +7,7 @@ use illusion_core::{
     SegmentStatus, TaskStatus,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +53,7 @@ struct IllusionApp {
 
 impl IllusionApp {
     fn new(cc: &eframe::CreationContext<'_>, rt: Arc<tokio::runtime::Runtime>) -> Self {
-        // Configure Hyprland dark theme
+        // Configure Hyprland dark theme (Catppuccin Mocha)
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(30, 30, 46); // Catppuccin Base #1e1e2e
         visuals.window_fill = Color32::from_rgb(24, 24, 37); // Crust
@@ -82,11 +82,11 @@ impl IllusionApp {
         // Spawn StatusNotifierItem Tray for Waybar / Hyprland
         tray::spawn_tray(rt.clone(), pause_all_flag.clone(), resume_all_flag.clone());
 
-        // Spawn Unix Domain Socket IPC Daemon
+        // Spawn Unix Domain Socket & Local HTTP Bridge IPC Daemon
         let (ipc_tx, ipc_rx) = mpsc::unbounded_channel::<String>();
         ipc::start_ipc_server(rt.clone(), state.clone(), ipc_tx, cc.egui_ctx.clone());
 
-        Self {
+        let mut app = Self {
             state,
             selected_category: DownloadCategory::All,
             selected_task_id: None,
@@ -105,7 +105,21 @@ impl IllusionApp {
             pause_all_flag,
             resume_all_flag,
             ipc_rx,
+        };
+
+        // Auto-resume Queued tasks on launch
+        let queued_tasks = {
+            let list = app.state.tasks.read().unwrap();
+            list.iter()
+                .filter(|t| t.status == TaskStatus::Queued)
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>()
+        };
+        for id in queued_tasks {
+            app.start_download(id);
         }
+
+        app
     }
 
     fn start_download(&mut self, task_id: String) {
@@ -140,9 +154,7 @@ impl IllusionApp {
     }
 
     fn resume_all(&mut self) {
-        let tasks = self.tokio_rt.block_on(async {
-            self.state.tasks.read().await.clone()
-        });
+        let tasks = self.state.tasks.read().unwrap().clone();
         for task in tasks {
             if task.status == TaskStatus::Paused || task.status == TaskStatus::Queued {
                 self.start_download(task.id);
@@ -173,7 +185,7 @@ impl eframe::App for IllusionApp {
             ctx.request_repaint_after(Duration::from_millis(400));
         }
 
-        // Process IPC messages from browser native host
+        // Process IPC messages from browser native host / HTTP bridge
         while let Ok(task_id) = self.ipc_rx.try_recv() {
             self.selected_task_id = Some(task_id.clone());
             self.start_download(task_id);
@@ -189,9 +201,7 @@ impl eframe::App for IllusionApp {
 
         // Clean up finished workers
         {
-            let tasks = self.tokio_rt.block_on(async {
-                self.state.tasks.read().await.clone()
-            });
+            let tasks = self.state.tasks.read().unwrap().clone();
 
             self.active_workers.retain(|id, _| {
                 if let Some(t) = tasks.iter().find(|t| &t.id == id) {
@@ -225,35 +235,55 @@ impl eframe::App for IllusionApp {
                         }
                     }
 
+                    if ui.button("▶ Resume All").clicked() {
+                        self.resume_all();
+                    }
+
+                    if ui.button("⏸ Pause All").clicked() {
+                        self.pause_all();
+                    }
+
                     ui.separator();
 
                     let selected_id = self.selected_task_id.clone();
                     if let Some(ref id) = selected_id {
-                        if ui.button("▶ Resume").clicked() {
-                            self.start_download(id.clone());
-                        }
+                        let task_opt = self.state.get_task_sync(id);
 
-                        if ui.button("⏸ Pause").clicked() {
-                            self.pause_download(id);
-                        }
+                        if let Some(ref task) = task_opt {
+                            if task.status == TaskStatus::Completed {
+                                if ui.button(
+                                    egui::RichText::new("▶ Open File")
+                                        .strong()
+                                        .color(Color32::from_rgb(166, 227, 161)),
+                                ).clicked() {
+                                    if task.save_path.exists() {
+                                        open_media_or_file(&task.save_path);
+                                    }
+                                }
+                            } else if task.status == TaskStatus::Downloading {
+                                if ui.button("⏸ Pause").clicked() {
+                                    self.pause_download(id);
+                                }
+                            } else {
+                                if ui.button("▶ Resume").clicked() {
+                                    self.start_download(id.clone());
+                                }
+                            }
 
-                        if ui.button("🗑 Remove").clicked() {
-                            self.pause_download(id);
-                            let tid = id.clone();
-                            let state = self.state.clone();
-                            self.tokio_rt.block_on(async {
-                                state.remove_task(&tid).await;
-                            });
-                            self.selected_task_id = None;
-                        }
-
-                        if ui.button("📁 Open Folder").clicked() {
-                            let state = self.state.clone();
-                            let tid = id.clone();
-                            if let Some(task) = self.tokio_rt.block_on(async { state.get_task(&tid).await }) {
+                            if ui.button("📁 Open Folder").clicked() {
                                 if let Some(parent) = task.save_path.parent() {
                                     let _ = open::that(parent);
                                 }
+                            }
+
+                            if ui.button("🗑 Remove").clicked() {
+                                self.pause_download(id);
+                                let tid = id.clone();
+                                let state = self.state.clone();
+                                self.tokio_rt.spawn(async move {
+                                    state.remove_task(&tid).await;
+                                });
+                                self.selected_task_id = None;
                             }
                         }
                     }
@@ -330,7 +360,7 @@ impl eframe::App for IllusionApp {
 
         // 3. Bottom IDM Segment Visualizer Panel
         if let Some(ref sel_id) = self.selected_task_id.clone() {
-            let task_opt = self.tokio_rt.block_on(async { self.state.get_task(sel_id).await });
+            let task_opt = self.state.get_task_sync(sel_id);
             if let Some(task) = task_opt {
                 egui::TopBottomPanel::bottom("bottom_segment_panel")
                     .resizable(true)
@@ -346,9 +376,7 @@ impl eframe::App for IllusionApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::from_rgb(30, 30, 46)).inner_margin(Margin::same(12.0)))
             .show(ctx, |ui| {
-                let tasks = self.tokio_rt.block_on(async {
-                    self.state.tasks.read().await.clone()
-                });
+                let tasks = self.state.tasks.read().unwrap().clone();
 
                 let filtered: Vec<_> = tasks
                     .into_iter()
@@ -360,6 +388,11 @@ impl eframe::App for IllusionApp {
                         }
                     })
                     .collect();
+
+                let mut action_select: Option<String> = None;
+                let mut action_open_file: Option<PathBuf> = None;
+                let mut action_resume: Option<String> = None;
+                let mut action_pause: Option<String> = None;
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     egui::Grid::new("task_grid")
@@ -379,8 +412,19 @@ impl eframe::App for IllusionApp {
                                 let is_selected = self.selected_task_id.as_deref() == Some(&task.id);
                                 let name_label = format!("{} {}", task.category.icon(), task.filename);
 
-                                if ui.selectable_label(is_selected, name_label).clicked() {
-                                    self.selected_task_id = Some(task.id.clone());
+                                let label_resp = ui.selectable_label(is_selected, name_label);
+                                if label_resp.clicked() {
+                                    action_select = Some(task.id.clone());
+                                }
+                                if label_resp.double_clicked() {
+                                    action_select = Some(task.id.clone());
+                                    if task.status == TaskStatus::Completed && task.save_path.exists() {
+                                        action_open_file = Some(task.save_path.clone());
+                                    } else if task.status == TaskStatus::Paused {
+                                        action_resume = Some(task.id.clone());
+                                    } else if task.status == TaskStatus::Downloading {
+                                        action_pause = Some(task.id.clone());
+                                    }
                                 }
 
                                 ui.label(task.formatted_size());
@@ -404,6 +448,19 @@ impl eframe::App for IllusionApp {
                             }
                         });
                 });
+
+                if let Some(id) = action_select {
+                    self.selected_task_id = Some(id);
+                }
+                if let Some(path) = action_open_file {
+                    open_media_or_file(&path);
+                }
+                if let Some(id) = action_resume {
+                    self.start_download(id);
+                }
+                if let Some(id) = action_pause {
+                    self.pause_download(&id);
+                }
             });
 
         // 5. Add URL / Multiline Batch Download Modal
@@ -560,9 +617,7 @@ impl eframe::App for IllusionApp {
 
 impl IllusionApp {
     fn calc_total_speed(&self) -> String {
-        let tasks = self.tokio_rt.block_on(async {
-            self.state.tasks.read().await.clone()
-        });
+        let tasks = self.state.tasks.read().unwrap().clone();
 
         let total: f64 = tasks
             .iter()
@@ -576,6 +631,45 @@ impl IllusionApp {
             "0 B/s".to_string()
         }
     }
+}
+
+/// Reliably opens a media or general file using VLC (for audio/video) or system default (xdg-open / open::that)
+fn open_media_or_file(path: &Path) {
+    let p = path.to_path_buf();
+    std::thread::spawn(move || {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let is_media = ["mp4", "mkv", "webm", "avi", "mov", "flv", "wmv", "mp3", "wav", "flac", "m4a", "aac", "ogg"]
+            .contains(&ext.as_str());
+
+        if is_media {
+            // First try launching VLC directly with decoupled stdio
+            if let Ok(mut child) = std::process::Command::new("vlc")
+                .arg(&p)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                let _ = child.wait();
+                return;
+            }
+        }
+
+        // Fallback to xdg-open
+        if let Ok(mut child) = std::process::Command::new("xdg-open")
+            .arg(&p)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            let _ = child.wait();
+            return;
+        }
+
+        // Final fallback
+        let _ = open::that(&p);
+    });
 }
 
 /// Renders the iconic IDM Multi-Segment Visualizer Bar
@@ -656,6 +750,7 @@ fn render_segment_visualizer(ui: &mut egui::Ui, task: &DownloadTask) {
 }
 
 fn main() -> eframe::Result<()> {
+    tracing_subscriber::fmt::init();
     let rt = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
