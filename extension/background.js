@@ -57,15 +57,39 @@ function inferQuality(url, mime, sizeBytes) {
   const lowerUrl = url.toLowerCase();
   let quality = "";
 
-  if (lowerUrl.includes("1080p") || lowerUrl.includes("1080")) quality = "1080p Full HD";
-  else if (lowerUrl.includes("720p") || lowerUrl.includes("720")) quality = "720p HD";
-  else if (lowerUrl.includes("480p") || lowerUrl.includes("480")) quality = "480p SD";
-  else if (lowerUrl.includes("360p") || lowerUrl.includes("360")) quality = "360p Low";
-  else if (lowerUrl.includes(".m3u8") || mime.includes("mpegurl")) quality = "HLS Stream (.m3u8)";
-  else if (lowerUrl.includes(".mpd") || mime.includes("dash+xml")) quality = "DASH Manifest (.mpd)";
-  else if (mime.startsWith("audio/")) quality = "Audio Track";
-  else if (mime.startsWith("video/")) quality = "Video Stream";
-  else quality = "Media File";
+  // Check YouTube itag
+  try {
+    const itag = new URL(url).searchParams.get("itag");
+    const ytItagMap = {
+      "18": "360p MP4 (Standard)",
+      "22": "720p HD MP4",
+      "137": "1080p Full HD Video",
+      "136": "720p HD Video",
+      "135": "480p SD Video",
+      "134": "360p Video",
+      "140": "Audio Track M4A (128kbps)",
+      "251": "Audio Track Opus (160kbps)",
+      "250": "Audio Track Opus (70kbps)",
+      "249": "Audio Track Opus (50kbps)",
+      "313": "2160p 4K UHD Video",
+      "271": "1440p 2K Video"
+    };
+    if (itag && ytItagMap[itag]) {
+      quality = ytItagMap[itag];
+    }
+  } catch (_) {}
+
+  if (!quality) {
+    if (lowerUrl.includes("1080p") || lowerUrl.includes("1080")) quality = "1080p Full HD";
+    else if (lowerUrl.includes("720p") || lowerUrl.includes("720")) quality = "720p HD";
+    else if (lowerUrl.includes("480p") || lowerUrl.includes("480")) quality = "480p SD";
+    else if (lowerUrl.includes("360p") || lowerUrl.includes("360")) quality = "360p Low";
+    else if (lowerUrl.includes(".m3u8") || mime.includes("mpegurl")) quality = "HLS Stream (.m3u8)";
+    else if (lowerUrl.includes(".mpd") || mime.includes("dash+xml")) quality = "DASH Manifest (.mpd)";
+    else if (mime.startsWith("audio/")) quality = "Audio Track";
+    else if (mime.startsWith("video/")) quality = "Video Stream";
+    else quality = "Media File";
+  }
 
   let sizeStr = "";
   if (sizeBytes && sizeBytes > 0) {
@@ -106,6 +130,18 @@ chrome.webRequest.onHeadersReceived.addListener(
     }
 
     const cleanUrl = url.split("?")[0].toLowerCase();
+    const isYouTubePlayback = url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback");
+
+    let targetDownloadUrl = url;
+    if (isYouTubePlayback) {
+      try {
+        const u = new URL(url);
+        u.searchParams.delete("range");
+        u.searchParams.delete("rn");
+        targetDownloadUrl = u.toString();
+      } catch (_) {}
+    }
+
     const isMediaMime =
       contentType.startsWith("video/") ||
       contentType.startsWith("audio/") ||
@@ -128,20 +164,20 @@ chrome.webRequest.onHeadersReceived.addListener(
       cleanUrl.endsWith(".aac") ||
       cleanUrl.endsWith(".wav");
 
-    // Filter out tiny audio effects/icons (< 200KB unless it is an m3u8 playlist or mpd)
+    // Filter out tiny audio effects/icons (< 200KB unless it is an m3u8 playlist or mpd or YouTube stream)
     const isPlaylist = cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mpd") || contentType.includes("mpegurl") || contentType.includes("dash");
-    if (!isPlaylist && contentLength > 0 && contentLength < 200 * 1024) {
+    if (!isYouTubePlayback && !isPlaylist && contentLength > 0 && contentLength < 200 * 1024) {
       return;
     }
 
-    if (isMediaMime || isMediaExt) {
+    if (isYouTubePlayback || isMediaMime || isMediaExt) {
       getTabStreams(details.tabId).then((streams) => {
         // Avoid duplicates
-        if (!streams.some((s) => s.url === url)) {
+        if (!streams.some((s) => s.url === targetDownloadUrl)) {
           const quality = inferQuality(url, contentType, contentLength);
           const item = {
-            url: url,
-            mime: contentType,
+            url: targetDownloadUrl,
+            mime: contentType || (isYouTubePlayback ? "video/mp4" : "application/octet-stream"),
             size: contentLength,
             quality: quality,
             timestamp: Date.now()

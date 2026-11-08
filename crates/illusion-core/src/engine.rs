@@ -464,6 +464,13 @@ impl DownloadEngine {
             }
         }
 
+        if url.contains("googlevideo.com") && !headers.contains_key(reqwest::header::REFERER) {
+            headers.insert(
+                reqwest::header::REFERER,
+                HeaderValue::from_static("https://www.youtube.com/"),
+            );
+        }
+
         let mut resp = self.client.get(url).headers(headers).send().await?;
         if !resp.status().is_success() {
             return Err(anyhow!("Server returned HTTP {}", resp.status()));
@@ -537,6 +544,13 @@ async fn run_segment_worker(
             if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
                 req_headers.insert(name, val);
             }
+        }
+
+        if url.contains("googlevideo.com") && !req_headers.contains_key(reqwest::header::REFERER) {
+            req_headers.insert(
+                reqwest::header::REFERER,
+                HeaderValue::from_static("https://www.youtube.com/"),
+            );
         }
         if let Some(ref ua) = user_agent {
             if let Ok(val) = HeaderValue::from_str(ua) {

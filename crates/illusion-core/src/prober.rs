@@ -38,6 +38,15 @@ pub async fn probe_url(
         );
     }
 
+    if parsed_url.host_str().map_or(false, |h| h.contains("googlevideo.com")) {
+        if !custom_headers.contains_key(reqwest::header::REFERER) {
+            custom_headers.insert(
+                reqwest::header::REFERER,
+                HeaderValue::from_static("https://www.youtube.com/"),
+            );
+        }
+    }
+
     // Try HEAD request first
     let head_req = client.head(url_str).headers(custom_headers.clone());
     let resp = head_req.send().await;
