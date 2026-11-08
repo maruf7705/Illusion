@@ -305,16 +305,33 @@
       }
     });
 
-    // Test & automation dispatch hooks
-    window.addEventListener("__ILLUSION_TEST_EXPAND__", () => {
+    // Test & automation dispatch hooks (supports both CustomEvent and cross-world postMessage)
+    function handleTestExpand() {
       toggleBtn.click();
-    });
-    window.addEventListener("__ILLUSION_TEST_DOWNLOAD__", (e) => {
-      const idx = (e.detail && e.detail.index) || 0;
+    }
+    function handleTestDownload(idx) {
       const list = dropdownMenu.querySelector("#illusion-stream-list");
       if (list) {
         const rows = list.querySelectorAll(".idm-menu-row");
         if (rows && rows[idx]) rows[idx].click();
+      }
+    }
+
+    window.addEventListener("__ILLUSION_TEST_EXPAND__", handleTestExpand);
+    document.addEventListener("__ILLUSION_TEST_EXPAND__", handleTestExpand);
+    window.addEventListener("__ILLUSION_TEST_DOWNLOAD__", (e) => {
+      handleTestDownload((e.detail && e.detail.index) || 0);
+    });
+    document.addEventListener("__ILLUSION_TEST_DOWNLOAD__", (e) => {
+      handleTestDownload((e.detail && e.detail.index) || 0);
+    });
+
+    window.addEventListener("message", (e) => {
+      if (!e.data) return;
+      if (e.data.type === "__ILLUSION_TEST_EXPAND__") {
+        handleTestExpand();
+      } else if (e.data.type === "__ILLUSION_TEST_DOWNLOAD__") {
+        handleTestDownload(e.data.index || 0);
       }
     });
   }
@@ -326,6 +343,14 @@
     listContainer.innerHTML = "";
 
     let displayList = currentStreams.slice();
+
+    // Sort streams like IDM: highest quality/size first, audio tracks at bottom
+    displayList.sort((a, b) => {
+      const aAudio = (a.mime || "").includes("audio");
+      const bAudio = (b.mime || "").includes("audio");
+      if (aAudio !== bAudio) return aAudio ? 1 : -1;
+      return (b.size || 0) - (a.size || 0);
+    });
 
     if (displayList.length === 0) {
       const emptyRow = document.createElement("div");
@@ -425,7 +450,9 @@
       type: "START_VIDEO_DOWNLOAD",
       url: stream.url,
       filename: filename,
-      audio_url: stream.audioUrl || null
+      audio_url: stream.audioUrl || null,
+      page_url: window.location.href,
+      quality: stream.quality || ""
     });
   }
 
@@ -478,6 +505,7 @@
 
     if (msg.type === "STREAM_REGISTRY_UPDATED" && Array.isArray(msg.streams)) {
       currentStreams = msg.streams;
+      window.__ILLUSION_DISCOVERED_STREAMS__ = currentStreams;
       if (barContainer) {
         const badge = barContainer.querySelector("#illusion-stream-count");
         if (badge) {

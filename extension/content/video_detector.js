@@ -102,13 +102,23 @@
     subtree: true
   });
 
-  // 3. Listen to CustomEvents from Main-World Hook
-  window.addEventListener("__ILLUSION_STREAM_DISCOVERED__", (e) => {
-    if (e.detail) {
+  // 3. Listen to CustomEvents and cross-world postMessages from Main-World Hook
+  function onDiscoveredStream(detail) {
+    if (detail && detail.url) {
       chrome.runtime.sendMessage({
         type: "ILLUSION_STREAM_DISCOVERED",
-        stream: e.detail
+        stream: detail
       }).catch(() => {});
+    }
+  }
+
+  window.addEventListener("__ILLUSION_STREAM_DISCOVERED__", (e) => {
+    onDiscoveredStream(e.detail);
+  });
+
+  window.addEventListener("message", (e) => {
+    if (e.data && e.data.source === "illusion_mse_hook" && e.data.type === "__ILLUSION_STREAM_DISCOVERED__") {
+      onDiscoveredStream(e.data.detail);
     }
   });
 

@@ -84,7 +84,7 @@ impl IllusionApp {
 
         // Spawn Unix Domain Socket IPC Daemon
         let (ipc_tx, ipc_rx) = mpsc::unbounded_channel::<String>();
-        ipc::start_ipc_server(rt.clone(), state.clone(), ipc_tx);
+        ipc::start_ipc_server(rt.clone(), state.clone(), ipc_tx, cc.egui_ctx.clone());
 
         Self {
             state,
@@ -165,10 +165,12 @@ impl IllusionApp {
 
 impl eframe::App for IllusionApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Continuous repaint during active downloads for smooth 60fps graphs
+        // Continuous repaint: 100ms during active downloads, 400ms idle polling for IPC
         let has_active = !self.active_workers.is_empty();
         if has_active {
-            ctx.request_repaint_after(Duration::from_millis(200));
+            ctx.request_repaint_after(Duration::from_millis(100));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(400));
         }
 
         // Process IPC messages from browser native host

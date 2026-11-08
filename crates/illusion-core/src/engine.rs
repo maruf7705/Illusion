@@ -106,6 +106,31 @@ impl DownloadEngine {
             }
         }
 
+        // Multi-Engine Classification: Check if stream requires Extractor or HLS
+        let mode = crate::stream_engine::StreamEngine::classify_task(&task);
+        match mode {
+            crate::stream_engine::StreamDispatchMode::ExtractorFallback => {
+                return crate::stream_engine::StreamEngine::download_extractor(
+                    &task_id,
+                    &task,
+                    state,
+                    cancel_rx,
+                )
+                .await;
+            }
+            crate::stream_engine::StreamDispatchMode::HlsDashSegmented => {
+                return crate::stream_engine::StreamEngine::download_hls(
+                    &self.client,
+                    &task_id,
+                    &task,
+                    state,
+                    &mut cancel_rx,
+                )
+                .await;
+            }
+            _ => {}
+        }
+
         // Probe if total size or range capability unknown
         let remote_info = probe_url(
             &self.client,
@@ -213,19 +238,33 @@ impl DownloadEngine {
                     }
                 }
 
+                let meta = tokio::fs::metadata(&task.save_path).await.ok();
+                let actual_bytes = meta.map(|m| m.len()).unwrap_or(0);
+                if actual_bytes < 128 {
+                    let mut list = state.tasks.write().await;
+                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                        t.status = TaskStatus::Error;
+                        t.error_message = Some("Downloaded file is empty or corrupted".to_string());
+                        t.speed = 0.0;
+                    }
+                    let _ = state.save_tasks().await;
+                    return Err(anyhow!("Downloaded file is empty or corrupted ({} bytes)", actual_bytes));
+                }
+
                 let mut list = state.tasks.write().await;
                 if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
                     t.status = TaskStatus::Completed;
                     t.speed = 0.0;
                     t.eta_seconds = None;
                     t.completed_at = Some(chrono::Utc::now());
-                    if let Some(sz) = t.total_size {
-                        t.downloaded_size = sz;
+                    t.downloaded_size = actual_bytes;
+                    if t.total_size.is_none() {
+                        t.total_size = Some(actual_bytes);
                     }
                 }
                 drop(list);
                 let _ = state.save_tasks().await;
-                info!("Task {} finished successfully!", task.filename);
+                info!("Task {} finished successfully! ({} bytes)", task.filename, actual_bytes);
 
                 // Send desktop notification
                 #[cfg(target_os = "linux")]
@@ -536,6 +575,18 @@ impl DownloadEngine {
                     t.speed = speed;
                 }
             }
+        }
+
+        // Always update total downloaded size at end
+        {
+            let mut list = state.tasks.write().await;
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.downloaded_size = downloaded;
+            }
+        }
+
+        if downloaded < 128 {
+            return Err(anyhow!("Received empty or invalid payload ({} bytes)", downloaded));
         }
 
         Ok(())

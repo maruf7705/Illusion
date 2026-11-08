@@ -38,18 +38,29 @@ pub async fn probe_url(
         );
     }
 
-    if parsed_url.host_str().map_or(false, |h| h.contains("googlevideo.com")) {
+    let is_googlevideo = parsed_url.host_str().map_or(false, |h| h.contains("googlevideo.com"));
+    if is_googlevideo {
         if !custom_headers.contains_key(reqwest::header::REFERER) {
             custom_headers.insert(
                 reqwest::header::REFERER,
                 HeaderValue::from_static("https://www.youtube.com/"),
             );
         }
+        if !custom_headers.contains_key(reqwest::header::ORIGIN) {
+            custom_headers.insert(
+                reqwest::header::ORIGIN,
+                HeaderValue::from_static("https://www.youtube.com"),
+            );
+        }
     }
 
-    // Try HEAD request first
-    let head_req = client.head(url_str).headers(custom_headers.clone());
-    let resp = head_req.send().await;
+    // Try HEAD request first (skip for googlevideo/streaming CDNs which reject HEAD with 403)
+    let resp = if is_googlevideo {
+        None
+    } else {
+        let head_req = client.head(url_str).headers(custom_headers.clone());
+        head_req.send().await.ok()
+    };
 
     let mut is_head_ok = false;
     let mut total_size: Option<u64> = None;
@@ -59,7 +70,7 @@ pub async fn probe_url(
     let mut content_type = None;
     let mut disposition_filename = None;
 
-    if let Ok(ref r) = resp {
+    if let Some(ref r) = resp {
         if r.status().is_success() {
             is_head_ok = true;
             let headers = r.headers();

@@ -423,22 +423,44 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (tabId >= 0 && request.stream && request.stream.url) {
       getTabStreams(tabId).then((streams) => {
         const streamUrl = request.stream.url;
-        if (!streams.some((s) => s.url === streamUrl)) {
-          streams.push({
-            url: streamUrl,
-            mime: request.stream.mime || "video/mp4",
-            quality: request.stream.quality || "720p HD",
-            audioUrl: request.stream.audioUrl || null,
-            codecs: request.stream.codecs || null,
-            timestamp: Date.now()
-          });
-          saveTabStreams(tabId, streams);
+        let itag = null;
+        try {
+          itag = new URL(streamUrl).searchParams.get("itag");
+        } catch (_) {}
 
-          chrome.tabs.sendMessage(tabId, {
-            type: "STREAM_REGISTRY_UPDATED",
-            streams: streams
-          }, { frameId: 0 }).catch(() => {});
+        // Match by itag or exact URL
+        const existingIdx = streams.findIndex((s) => {
+          if (s.url === streamUrl) return true;
+          if (itag) {
+            try {
+              return new URL(s.url).searchParams.get("itag") === itag;
+            } catch (_) {}
+          }
+          return false;
+        });
+
+        const newItem = {
+          url: streamUrl,
+          mime: request.stream.mime || "video/mp4",
+          quality: request.stream.quality || "720p HD",
+          size: request.stream.size || 0,
+          audioUrl: request.stream.audioUrl || null,
+          codecs: request.stream.codecs || null,
+          timestamp: Date.now()
+        };
+
+        if (existingIdx >= 0) {
+          streams[existingIdx] = newItem;
+        } else {
+          streams.push(newItem);
         }
+
+        saveTabStreams(tabId, streams);
+
+        chrome.tabs.sendMessage(tabId, {
+          type: "STREAM_REGISTRY_UPDATED",
+          streams: streams
+        }, { frameId: 0 }).catch(() => {});
       });
     }
     return;
@@ -446,12 +468,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // User clicked a download row in the Floating Bar UI
   if (request.type === "START_VIDEO_DOWNLOAD" || request.type === "MEDIA_SNIFFED_DOWNLOAD") {
-    const referer = sender.tab ? sender.tab.url : "";
+    const referer = request.page_url || (sender.tab ? sender.tab.url : "");
     sendToIllusion({
       url: request.url,
       filename: request.filename || "",
       referer: referer,
-      audio_url: request.audio_url || null
+      audio_url: request.audio_url || null,
+      quality: request.quality || ""
     }).then(() => {
       sendResponse({ status: "success" });
     });

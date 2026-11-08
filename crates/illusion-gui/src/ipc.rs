@@ -1,3 +1,4 @@
+use eframe::egui;
 use illusion_core::{AppState, DownloadTask};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -41,6 +42,7 @@ pub fn start_ipc_server(
     rt: Arc<tokio::runtime::Runtime>,
     state: AppState,
     task_notifier: mpsc::UnboundedSender<String>,
+    egui_ctx: egui::Context,
 ) {
     let socket_path = get_ipc_socket_path();
 
@@ -64,6 +66,7 @@ pub fn start_ipc_server(
                 Ok((mut stream, _addr)) => {
                     let state = state.clone();
                     let notifier = task_notifier.clone();
+                    let ctx = egui_ctx.clone();
 
                     tokio::spawn(async move {
                         let mut buf = vec![0u8; 65536];
@@ -109,8 +112,9 @@ pub fn start_ipc_server(
                                         let task_id = task.id.clone();
                                         state.add_task(task).await;
 
-                                        // Notify GUI to auto-start or highlight
+                                        // Notify GUI to auto-start and wake up egui event loop immediately!
                                         let _ = notifier.send(task_id.clone());
+                                        ctx.request_repaint();
 
                                         let resp = IpcResponse {
                                             status: "success".to_string(),
