@@ -175,9 +175,34 @@
     });
   } catch (_) {}
 
-  // 3. Fallback: Direct DOM Video/Audio Inspection
+  // 3. Recursive DOM and Shadow DOM Video/Audio Inspection
+  function findMediaElements(root = document) {
+    const elements = [];
+    function traverse(node) {
+      if (!node) return;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const tag = node.tagName.toLowerCase();
+        if (tag === "video" || tag === "audio") {
+          elements.push(node);
+        }
+        if (node.shadowRoot) {
+          traverse(node.shadowRoot);
+        }
+      }
+      let child = node.firstElementChild;
+      while (child) {
+        traverse(child);
+        child = child.nextElementSibling;
+      }
+    }
+    try {
+      traverse(root);
+    } catch (_) {}
+    return elements;
+  }
+
   function scanMediaTags() {
-    const mediaElements = document.querySelectorAll("video, audio");
+    const mediaElements = findMediaElements(document);
     mediaElements.forEach((el) => {
       let src = el.currentSrc || el.src;
       if (!src) {
@@ -195,6 +220,40 @@
       }
     });
   }
+
+  // 4. Fullscreen Adaptive Reparenting (Keep IDM bar visible in Fullscreen mode!)
+  function handleFullscreenChange() {
+    if (!floatingPanel) return;
+    const fsElement = document.fullscreenElement || document.webkitFullscreenElement;
+    if (fsElement) {
+      if (!fsElement.contains(floatingPanel)) {
+        floatingPanel._originalParent = floatingPanel.parentElement;
+        floatingPanel._originalNextSibling = floatingPanel.nextSibling;
+        fsElement.appendChild(floatingPanel);
+        floatingPanel.style.position = "absolute";
+        floatingPanel.style.top = "20px";
+        floatingPanel.style.right = "20px";
+        floatingPanel.style.zIndex = "2147483647";
+      }
+    } else {
+      if (floatingPanel._originalParent) {
+        try {
+          if (floatingPanel._originalNextSibling) {
+            floatingPanel._originalParent.insertBefore(floatingPanel, floatingPanel._originalNextSibling);
+          } else {
+            floatingPanel._originalParent.appendChild(floatingPanel);
+          }
+        } catch (_) {
+          document.body.appendChild(floatingPanel);
+        }
+        floatingPanel._originalParent = null;
+        floatingPanel._originalNextSibling = null;
+      }
+    }
+  }
+
+  document.addEventListener("fullscreenchange", handleFullscreenChange);
+  document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
 
   scanMediaTags();
   const observer = new MutationObserver(() => scanMediaTags());
