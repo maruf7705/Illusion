@@ -135,30 +135,28 @@ chrome.webRequest.onHeadersReceived.addListener(
     }
 
     if (isMediaMime || isMediaExt) {
-      if (!tabStreams.has(details.tabId)) {
-        tabStreams.set(details.tabId, []);
-      }
+      getTabStreams(details.tabId).then((streams) => {
+        // Avoid duplicates
+        if (!streams.some((s) => s.url === url)) {
+          const quality = inferQuality(url, contentType, contentLength);
+          const item = {
+            url: url,
+            mime: contentType,
+            size: contentLength,
+            quality: quality,
+            timestamp: Date.now()
+          };
+          streams.push(item);
+          saveTabStreams(details.tabId, streams);
 
-      const streams = tabStreams.get(details.tabId);
-      // Avoid duplicates
-      if (!streams.some((s) => s.url === url)) {
-        const quality = inferQuality(url, contentType, contentLength);
-        const item = {
-          url: url,
-          mime: contentType,
-          size: contentLength,
-          quality: quality,
-          timestamp: Date.now()
-        };
-        streams.push(item);
-
-        // Broadcast to tab's content script to update the floating IDM bar
-        chrome.tabs.sendMessage(details.tabId, {
-          type: "ILLUSION_STREAM_DETECTED",
-          stream: item,
-          totalCount: streams.len
-        }).catch(() => {});
-      }
+          // Broadcast to tab's content script to update the floating IDM bar
+          chrome.tabs.sendMessage(details.tabId, {
+            type: "ILLUSION_STREAM_DETECTED",
+            stream: item,
+            totalCount: streams.length
+          }).catch(() => {});
+        }
+      });
     }
   },
   {
@@ -171,12 +169,12 @@ chrome.webRequest.onHeadersReceived.addListener(
 // Clear stream cache when tab navigates or closes
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "loading") {
-    tabStreams.delete(tabId);
+    removeTabStreams(tabId);
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  tabStreams.delete(tabId);
+  removeTabStreams(tabId);
 });
 
 // 2. Intercept regular browser downloads
@@ -272,8 +270,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   if (request.type === "GET_TAB_STREAMS") {
     const tabId = sender.tab ? sender.tab.id : -1;
-    const list = tabStreams.get(tabId) || [];
-    sendResponse({ streams: list });
+    getTabStreams(tabId).then((list) => {
+      sendResponse({ streams: list });
+    });
     return true;
   }
 
