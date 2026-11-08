@@ -16,6 +16,7 @@ pub struct IpcDownloadRequest {
     pub referer: Option<String>,
     pub cookies: Option<String>,
     pub user_agent: Option<String>,
+    pub audio_url: Option<String>,
     pub headers: Option<HashMap<String, String>>,
 }
 
@@ -94,7 +95,7 @@ pub fn start_ipc_server(
                                         }
 
                                         let save_path = state.default_download_dir.join(&filename);
-                                        let task = DownloadTask::new(
+                                        let mut task = DownloadTask::new(
                                             url,
                                             filename.clone(),
                                             save_path,
@@ -103,6 +104,7 @@ pub fn start_ipc_server(
                                             req.cookies,
                                             req.user_agent,
                                         );
+                                        task.audio_url = req.audio_url;
 
                                         let task_id = task.id.clone();
                                         state.add_task(task).await;

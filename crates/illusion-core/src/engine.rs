@@ -181,6 +181,38 @@ impl DownloadEngine {
 
         match res {
             Ok(_) => {
+                let _ = storage.sync_all().await;
+
+                // Adaptive Audio+Video Muxer (IDM-grade stream combiner)
+                if let Some(ref a_url) = task.audio_url {
+                    let audio_tmp_path = task.save_path.with_extension("audio_tmp.m4a");
+                    let video_tmp_path = task.save_path.with_extension("video_tmp.mp4");
+
+                    if let Ok(_) = tokio::fs::rename(&task.save_path, &video_tmp_path).await {
+                        info!("Downloading separate audio track for adaptive stream muxing...");
+                        if let Ok(audio_storage) = DiskStorage::create_or_open(&audio_tmp_path, None).await {
+                            let a_res = self.download_single_stream(
+                                &task_id,
+                                a_url,
+                                &task.headers,
+                                task.cookies.as_deref(),
+                                user_agent.as_deref(),
+                                audio_storage.clone(),
+                                state.clone(),
+                                &mut cancel_rx,
+                            ).await;
+                            let _ = audio_storage.sync_all().await;
+
+                            if a_res.is_ok() {
+                                info!("Multiplexing video + audio with FFmpeg...");
+                                let _ = crate::muxer::mux_video_and_audio(&video_tmp_path, &audio_tmp_path, &task.save_path).await;
+                            } else {
+                                let _ = tokio::fs::rename(&video_tmp_path, &task.save_path).await;
+                            }
+                        }
+                    }
+                }
+
                 let mut list = state.tasks.write().await;
                 if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
                     t.status = TaskStatus::Completed;
@@ -193,7 +225,6 @@ impl DownloadEngine {
                 }
                 drop(list);
                 let _ = state.save_tasks().await;
-                let _ = storage.sync_all().await;
                 info!("Task {} finished successfully!", task.filename);
 
                 // Send desktop notification

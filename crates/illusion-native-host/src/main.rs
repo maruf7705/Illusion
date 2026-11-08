@@ -16,6 +16,7 @@ struct NativeMessage {
     referer: Option<String>,
     cookies: Option<String>,
     user_agent: Option<String>,
+    audio_url: Option<String>,
     headers: Option<HashMap<String, String>>,
 }
 
@@ -131,7 +132,7 @@ async fn main() -> Result<()> {
                     }
 
                     let save_path = state.default_download_dir.join(&filename);
-                    let task = DownloadTask::new(
+                    let mut task = DownloadTask::new(
                         url,
                         filename.clone(),
                         save_path,
@@ -140,6 +141,7 @@ async fn main() -> Result<()> {
                         msg.cookies,
                         msg.user_agent,
                     );
+                    task.audio_url = msg.audio_url;
                     let task_id = task.id.clone();
                     state.add_task(task).await;
 

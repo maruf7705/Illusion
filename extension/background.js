@@ -276,6 +276,7 @@ async function sendToIllusion(details) {
       referer: details.referer || "",
       cookies: cookiesStr,
       user_agent: navigator.userAgent,
+      audio_url: details.audio_url || null,
       headers: details.headers || {}
     };
 
@@ -297,7 +298,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     sendToIllusion({
       url: request.url,
       filename: request.filename || "",
-      referer: sender.tab ? sender.tab.url : ""
+      referer: sender.tab ? sender.tab.url : "",
+      audio_url: request.audio_url || null
     }).then(() => {
       sendResponse({ status: "success" });
     });
@@ -342,9 +344,25 @@ chrome.runtime.onInstalled.addListener(async () => {
     title: "Download Media with Illusion",
     contexts: ["video", "audio", "image"]
   });
+
+  chrome.contextMenus.create({
+    id: "illusion-batch-grabber",
+    title: "Grab All Media on Page with Illusion",
+    contexts: ["page"]
+  });
 });
 
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
+  if (info.menuItemId === "illusion-batch-grabber") {
+    chrome.windows.create({
+      url: chrome.runtime.getURL("batch_grabber.html"),
+      type: "popup",
+      width: 720,
+      height: 560
+    });
+    return;
+  }
+
   let targetUrl = null;
   if (info.menuItemId === "illusion-download-link" && info.linkUrl) {
     targetUrl = info.linkUrl;

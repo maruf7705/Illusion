@@ -100,6 +100,7 @@ pub struct DownloadTask {
     pub headers: HashMap<String, String>,
     pub cookies: Option<String>,
     pub user_agent: Option<String>,
+    pub audio_url: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -131,6 +132,7 @@ impl DownloadTask {
             headers,
             cookies,
             user_agent,
+            audio_url: None,
             created_at: Utc::now(),
             completed_at: None,
         }

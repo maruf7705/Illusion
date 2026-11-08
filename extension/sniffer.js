@@ -8,6 +8,7 @@
   let dropdownMenu = null;
   let badgeElem = null;
   let isDropdownOpen = false;
+  let isDragging = false;
 
   function findTargetPlayerContainer() {
     // 1. YouTube specialized player containers
@@ -40,6 +41,7 @@
         </svg>
         <span class="illusion-video-text">Download this video</span>
         <span class="illusion-badge" id="illusion-stream-count">1</span>
+        <span class="illusion-pin-btn" id="illusion-bar-pin" title="Minimize / Maximize Bar">━</span>
         <span class="illusion-arrow" id="illusion-bar-arrow">▼</span>
       </div>
       <div class="illusion-stream-dropdown" id="illusion-stream-dropdown">
@@ -74,10 +76,63 @@
     dropdownMenu = container.querySelector("#illusion-stream-dropdown");
     badgeElem = container.querySelector("#illusion-stream-count");
     const arrowElem = container.querySelector("#illusion-bar-arrow");
+    const pinBtn = container.querySelector("#illusion-bar-pin");
 
-    toggleBtn.addEventListener("click", (e) => {
+    // Draggable Handling (Smooth dragging across video player)
+    let dragStartX = 0;
+    let dragStartY = 0;
+    let initialLeft = 0;
+    let initialTop = 0;
+
+    toggleBtn.addEventListener("mousedown", (e) => {
+      if (e.target.closest("#illusion-stream-dropdown") || e.target.closest("#illusion-bar-pin")) return;
+      isDragging = false;
+      dragStartX = e.clientX;
+      dragStartY = e.clientY;
+      const rect = container.getBoundingClientRect();
+      const parentRect = container.parentElement ? container.parentElement.getBoundingClientRect() : { left: 0, top: 0 };
+      initialLeft = rect.left - parentRect.left;
+      initialTop = rect.top - parentRect.top;
+
+      function onMouseMove(moveEvent) {
+        const dx = moveEvent.clientX - dragStartX;
+        const dy = moveEvent.clientY - dragStartY;
+        if (Math.abs(dx) > 4 || Math.abs(dy) > 4) {
+          isDragging = true;
+          container.style.right = "auto";
+          container.style.left = `${initialLeft + dx}px`;
+          container.style.top = `${initialTop + dy}px`;
+        }
+      }
+
+      function onMouseUp() {
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+        setTimeout(() => { isDragging = false; }, 50);
+      }
+
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    });
+
+    // Minimize pin toggle
+    pinBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       e.preventDefault();
+      container.classList.toggle("minimized");
+      pinBtn.innerText = container.classList.contains("minimized") ? "✚" : "━";
+    });
+
+    toggleBtn.addEventListener("click", (e) => {
+      if (isDragging) return;
+      e.stopPropagation();
+      e.preventDefault();
+
+      if (container.classList.contains("minimized")) {
+        container.classList.remove("minimized");
+        pinBtn.innerText = "━";
+        return;
+      }
 
       if (detectedStreams.length === 1 && !isDropdownOpen) {
         triggerDownload(detectedStreams[0]);
@@ -132,7 +187,7 @@
 
     listContainer.innerHTML = "";
 
-    // If no streams sniffed yet (e.g. YouTube initial load before playback request)
+    // If no streams sniffed yet
     if (detectedStreams.length === 0) {
       const defaultItem = document.createElement("div");
       defaultItem.className = "illusion-stream-item";
@@ -211,18 +266,31 @@
     chrome.runtime.sendMessage({
       type: "MEDIA_SNIFFED_DOWNLOAD",
       url: stream.url,
-      filename: filename
+      filename: filename,
+      audio_url: stream.audioUrl || null
     });
   }
 
-  // 1. Listen for background network-level stream detections
+  // 1. Listen for Main-World Hook detections from document.js
+  window.addEventListener("message", (event) => {
+    if (event.data && event.data.type === "__ILLUSION_MEDIA_STREAM__") {
+      addStream({
+        url: event.data.url,
+        quality: event.data.quality,
+        mime: event.data.mime,
+        audioUrl: event.data.audioUrl || null
+      });
+    }
+  });
+
+  // 2. Listen for background network-level stream detections
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === "ILLUSION_STREAM_DETECTED" && msg.stream) {
       addStream(msg.stream);
     }
   });
 
-  // 2. Query initial cached streams for this tab from background
+  // 3. Query initial cached streams for this tab from background
   try {
     chrome.runtime.sendMessage({ type: "GET_TAB_STREAMS" }, (res) => {
       if (res && res.streams && res.streams.length > 0) {
@@ -231,7 +299,7 @@
     });
   } catch (_) {}
 
-  // 3. YouTube Special Extractor
+  // 4. YouTube Special Extractor
   function checkYouTubePlayer() {
     if (!location.hostname.includes("youtube.com")) return;
 
@@ -243,7 +311,6 @@
         createFloatingPanel();
       }
 
-      // Add high quality download options if list is currently empty
       if (detectedStreams.length === 0) {
         const title = (document.title || "YouTube Video").replace(" - YouTube", "").trim();
         addStream({
@@ -262,7 +329,7 @@
     }
   }
 
-  // 4. Recursive DOM and Shadow DOM Video/Audio Inspection
+  // 5. Recursive DOM and Shadow DOM Video/Audio Inspection
   function findMediaElements(root = document) {
     const elements = [];
     function traverse(node) {
@@ -293,7 +360,6 @@
 
     const mediaElements = findMediaElements(document);
     mediaElements.forEach((el) => {
-      // If ANY video is found on page, ensure floating panel is present!
       if (!floatingPanel) {
         createFloatingPanel();
       }
@@ -315,7 +381,7 @@
     });
   }
 
-  // 5. Fullscreen Adaptive Reparenting
+  // 6. Fullscreen Adaptive Reparenting
   function handleFullscreenChange() {
     if (!floatingPanel) return;
     const fsElement = document.fullscreenElement || document.webkitFullscreenElement;
