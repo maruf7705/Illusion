@@ -1,0 +1,74 @@
+{
+  "manifest_version": 3,
+  "name": "Illusion Download Integration (Firefox & Zen)",
+  "version": "1.2.1",
+  "description": "IDM-grade video/audio sniffer and multi-segment download acceleration for Mozilla Firefox & Zen Browser.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "illusion@archlinux.org",
+      "strict_min_version": "109.0"
+    }
+  },
+  "permissions": [
+    "scripting",
+    "downloads",
+    "nativeMessaging",
+    "contextMenus",
+    "storage",
+    "cookies",
+    "webRequest",
+    "tabs",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/mse_hook_main_world.js"],
+      "world": "MAIN",
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/content_bootstrap.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/video_detector.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content/floating_bar_ui.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "content/mse_hook_main_world.js",
+        "icons/*",
+        "batch_grabber.html"
+      ],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_title": "Illusion Downloader"
+  },
+  "icons": {
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

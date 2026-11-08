@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Illusion Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="card">
+    <div class="header">
+      <div class="brand">
+        <div class="logo">⚡</div>
+        <div>
+          <h2>Illusion</h2>
+          <span class="sub">IDM for Linux & Hyprland</span>
+        </div>
+      </div>
+      <div id="status-pill" class="pill checking">Checking...</div>
+    </div>
+
+    <div class="content">
+      <div class="toggle-row">
+        <div>
+          <span class="label">Intercept Downloads</span>
+          <p class="desc">Catch browser downloads automatically</p>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="intercept-toggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="toggle-row">
+        <div>
+          <span class="label">Video Sniffer</span>
+          <p class="desc">Show floating download button on videos</p>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="sniffer-toggle" checked>
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="input-row">
+        <label class="label" for="min-size">Min File Size to Intercept</label>
+        <div class="input-group">
+          <input type="number" id="min-size" min="0" value="0">
+          <span>MB</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <button id="add-url-btn" class="btn primary">＋ Add Custom URL</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

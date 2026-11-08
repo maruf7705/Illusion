@@ -304,33 +304,81 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   removeTabStreams(tabId);
 });
 
-// 5. Intercept standard browser downloads
-chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
-  chrome.storage.local.get("settings", async (data) => {
-    const settings = data.settings || DEFAULT_SETTINGS;
-    if (!settings.enabled || !settings.interceptDownloads) {
-      suggest();
-      return;
-    }
+// 5. Intercept standard browser downloads (Cross-browser: Chrome onDeterminingFilename / Firefox onCreated)
+if (chrome.downloads && chrome.downloads.onDeterminingFilename) {
+  chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
+    chrome.storage.local.get("settings", async (data) => {
+      const settings = data.settings || DEFAULT_SETTINGS;
+      if (!settings.enabled || !settings.interceptDownloads) {
+        suggest();
+        return;
+      }
 
-    const url = downloadItem.url;
-    if (url.startsWith("blob:") || url.startsWith("data:") || url.startsWith("chrome://")) {
-      suggest();
-      return;
-    }
+      const url = downloadItem.url;
+      if (url.startsWith("blob:") || url.startsWith("data:") || url.startsWith("chrome://")) {
+        suggest();
+        return;
+      }
 
-    const filename = downloadItem.filename || "";
-    const ext = filename.split(".").pop().toLowerCase();
-    const shouldIntercept =
-      settings.fileExtensions.includes(ext) ||
-      downloadItem.fileSize > settings.minFileSizeMB * 1024 * 1024;
+      const filename = downloadItem.filename || "";
+      const ext = filename.split(".").pop().toLowerCase();
+      const shouldIntercept =
+        settings.fileExtensions.includes(ext) ||
+        downloadItem.fileSize > settings.minFileSizeMB * 1024 * 1024;
 
-    if (shouldIntercept) {
-      try {
-        // IDM Pattern: Pause first, probe Illusion, only cancel if Illusion accepted!
+      if (shouldIntercept) {
+        try {
+          // IDM Pattern: Pause first, probe Illusion, only cancel if Illusion accepted!
+          chrome.downloads.pause(downloadItem.id, async () => {
+            const ringData = getFromRingBuffer(downloadItem.url) || {};
+
+            const result = await sendToIllusion({
+              url: downloadItem.url,
+              filename: downloadItem.filename,
+              referer: downloadItem.referrer || ringData.referer || "",
+              file_size: downloadItem.fileSize || 0,
+              mime_type: downloadItem.mime || "",
+              headers: ringData.headers || {}
+            });
+
+            if (result && result.success) {
+              chrome.downloads.cancel(downloadItem.id, () => {
+                chrome.downloads.erase({ id: downloadItem.id });
+              });
+            } else {
+              console.warn("[Illusion] Illusion not available, resuming browser download");
+              chrome.downloads.resume(downloadItem.id);
+            }
+          });
+        } catch (err) {
+          console.error("[Illusion] Failed to intercept download:", err);
+          suggest();
+        }
+      } else {
+        suggest();
+      }
+    });
+
+    return true;
+  });
+} else if (chrome.downloads && chrome.downloads.onCreated) {
+  chrome.downloads.onCreated.addListener(async (downloadItem) => {
+    chrome.storage.local.get("settings", async (data) => {
+      const settings = data.settings || DEFAULT_SETTINGS;
+      if (!settings.enabled || !settings.interceptDownloads) return;
+
+      const url = downloadItem.url;
+      if (url.startsWith("blob:") || url.startsWith("data:") || url.startsWith("about:")) return;
+
+      const filename = downloadItem.filename || "";
+      const ext = filename.split(".").pop().toLowerCase();
+      const shouldIntercept =
+        settings.fileExtensions.includes(ext) ||
+        (downloadItem.fileSize > 0 && downloadItem.fileSize > settings.minFileSizeMB * 1024 * 1024);
+
+      if (shouldIntercept) {
         chrome.downloads.pause(downloadItem.id, async () => {
           const ringData = getFromRingBuffer(downloadItem.url) || {};
-
           const result = await sendToIllusion({
             url: downloadItem.url,
             filename: downloadItem.filename,
@@ -345,21 +393,13 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
               chrome.downloads.erase({ id: downloadItem.id });
             });
           } else {
-            console.warn("[Illusion] Illusion not available, resuming browser download");
             chrome.downloads.resume(downloadItem.id);
           }
         });
-      } catch (err) {
-        console.error("[Illusion] Failed to intercept download:", err);
-        suggest();
       }
-    } else {
-      suggest();
-    }
+    });
   });
-
-  return true;
-});
+}
 
 // 6. Dual-Channel IDM Communication Bridge (HTTP Loopback + Native Messaging)
 const HTTP_BRIDGE_URL = "http://127.0.0.1:9095/add_download";
