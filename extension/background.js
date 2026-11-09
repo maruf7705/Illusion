@@ -207,16 +207,8 @@ async function handleMediaResponse(tabId, details) {
   const cleanUrl = url.split("?")[0].toLowerCase();
   const isYouTubePlayback = url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback");
 
+  // IDM Standard: Pass raw captured URL directly to native engine without re-encoding
   let targetDownloadUrl = url;
-  if (isYouTubePlayback) {
-    try {
-      const u = new URL(url);
-      u.searchParams.delete("range");
-      u.searchParams.delete("rn");
-      u.searchParams.delete("alr");
-      targetDownloadUrl = u.toString();
-    } catch (_) {}
-  }
 
   const isMediaMime =
     contentType.startsWith("video/") ||

@@ -9,19 +9,9 @@
   const blobMediaMap = new Map();
   const capturedCodecs = [];
 
+  // IDM Standard: Pass raw URL intact to backend without URL re-encoding (which corrupts GoogleVideo HMAC)
   function cleanUrl(url) {
     if (!url || typeof url !== "string") return "";
-    try {
-      const u = new URL(url);
-      const sparams = (u.searchParams.get("sparams") || "").split(",");
-      // CRITICAL: Never strip parameters that are signed by Google Video sparams HMAC!
-      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag"].forEach((p) => {
-        if (!sparams.includes(p)) {
-          u.searchParams.delete(p);
-        }
-      });
-      return u.toString();
-    } catch (_) {}
     return url;
   }
 
@@ -53,8 +43,11 @@
       const u = new URL(url);
       if (u.pathname.includes("videoplayback") || u.hostname.includes("googlevideo.com")) {
         const itag = u.searchParams.get("itag");
+        const isSabr = u.searchParams.has("sabr") || u.searchParams.has("ump");
         const cleaned = cleanUrl(url);
-        if (itag) {
+
+        // IDM Standard: Never emit SABR/UMP chunk URLs as downloadable media (causes sabr.malformed_config)
+        if (!isSabr && itag) {
           liveItagUrls.set(itag, cleaned);
           const isAudio = ["140", "251", "250", "249"].includes(itag);
           if (isAudio) {
@@ -63,24 +56,33 @@
             lastActiveVideoUrl = cleaned;
           }
 
-          // Upgrade existing stream URLs with the live deciphered URL
-          if (window.__ILLUSION_DISCOVERED_STREAMS__) {
-            window.__ILLUSION_DISCOVERED_STREAMS__.forEach((s) => {
-              if (s && s.url) {
-                try {
-                  const sItag = new URL(s.url).searchParams.get("itag");
-                  if (sItag === itag) {
-                    s.url = cleaned;
-                  }
-                  if (isAudio && !s.audioUrl && (s.mime || "").includes("video")) {
-                    s.audioUrl = cleaned;
-                  }
-                } catch (_) {}
-              }
-            });
+          // Emit the live, deciphered stream immediately to detector & floating bar
+          const info = ytItagMap[itag] || { q: isAudio ? "Audio Track" : "720p HD", m: isAudio ? "audio/mp4" : "video/mp4" };
+          emitMediaDiscovery({
+            url: cleaned,
+            quality: info.q,
+            mime: info.m,
+            size: 0,
+            audioUrl: isAudio ? null : lastActiveAudioUrl
+          });
+
+          // If this is an audio track and we already have an active video stream, link them for dual-stream download
+          if (isAudio && lastActiveVideoUrl) {
+            try {
+              const vItag = new URL(lastActiveVideoUrl).searchParams.get("itag");
+              const vInfo = ytItagMap[vItag] || { q: "720p HD", m: "video/mp4" };
+              emitMediaDiscovery({
+                url: lastActiveVideoUrl,
+                quality: vInfo.q,
+                mime: vInfo.m,
+                size: 0,
+                audioUrl: cleaned
+              });
+            } catch (_) {}
           }
         }
         lastActivePlaybackUrl = cleaned;
+        inspectGlobalPlayerState(cleaned);
       }
     } catch (_) {}
   }
@@ -173,21 +175,26 @@
 
   function extractFormatUrl(f) {
     if (!f) return null;
-    if (f.url) return f.url;
-    const cipher = f.signatureCipher || f.cipher;
-    if (cipher) {
+    if (f.url && typeof f.url === "string") return f.url;
+    if (f.signatureCipher || f.cipher) {
       try {
-        const p = new URLSearchParams(cipher);
-        const rawUrl = p.get("url");
-        if (rawUrl) {
-          const sig = p.get("s");
-          const sp = p.get("sp") || "sig";
-          if (sig) {
-            return `${rawUrl}&${sp}=${encodeURIComponent(sig)}`;
-          }
-          return rawUrl;
+        const cipher = f.signatureCipher || f.cipher;
+        const params = new URLSearchParams(cipher);
+        const url = params.get("url");
+        const sig = params.get("s");
+        const sp = params.get("sp") || "sig";
+        if (url && sig) {
+          return `${url}&${sp}=${sig}`;
         }
+        if (url) return url;
       } catch (_) {}
+    }
+    // Check if we intercepted a clean non-SABR stream URL
+    if (f.itag && liveItagUrls.has(f.itag.toString())) {
+      const u = liveItagUrls.get(f.itag.toString());
+      if (u && !u.includes("sabr=1") && !u.includes("ump=1")) {
+        return u;
+      }
     }
     return null;
   }
@@ -197,23 +204,24 @@
     const formats = streaming.formats || [];
     const adaptive = streaming.adaptiveFormats || [];
 
-    // Find best audio URL
-    let bestAudioUrl = lastActiveAudioUrl || liveItagUrls.get("140") || liveItagUrls.get("251");
-    if (!bestAudioUrl) {
-      for (const fmt of adaptive) {
-        if (fmt.mimeType && fmt.mimeType.includes("audio")) {
-          const u = liveItagUrls.get(fmt.itag?.toString()) || extractFormatUrl(fmt);
-          if (u) {
-            bestAudioUrl = cleanUrl(u);
-            break;
-          }
+    // Find best audio URL from clean formats
+    let bestAudioUrl = null;
+    for (const fmt of adaptive) {
+      if (fmt.mimeType && fmt.mimeType.includes("audio")) {
+        const u = extractFormatUrl(fmt);
+        if (u) {
+          bestAudioUrl = cleanUrl(u);
+          break;
         }
       }
+    }
+    if (!bestAudioUrl && lastActiveAudioUrl && !lastActiveAudioUrl.includes("sabr=1")) {
+      bestAudioUrl = lastActiveAudioUrl;
     }
 
     // 1. Process regular muxed formats
     formats.forEach((f) => {
-      let streamUrl = liveItagUrls.get(f.itag?.toString()) || extractFormatUrl(f);
+      let streamUrl = extractFormatUrl(f);
       if (streamUrl) {
         emitMediaDiscovery({
           url: cleanUrl(streamUrl),
@@ -228,16 +236,7 @@
     // 2. Process adaptive video & audio formats
     adaptive.forEach((f) => {
       const isAudio = f.mimeType && f.mimeType.includes("audio");
-      let streamUrl = liveItagUrls.get(f.itag?.toString()) || extractFormatUrl(f);
-      if (!streamUrl && activeUrl) {
-        try {
-          const u = new URL(activeUrl);
-          if (u.searchParams.get("itag") === f.itag?.toString()) {
-            streamUrl = cleanUrl(activeUrl);
-          }
-        } catch (_) {}
-      }
-
+      let streamUrl = extractFormatUrl(f);
       if (streamUrl) {
         const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
         emitMediaDiscovery({
@@ -246,6 +245,9 @@
           mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
           size: parseInt(f.contentLength || "0", 10) || 0,
           audioUrl: isAudio ? null : bestAudioUrl
+        });
+      }
+    });
         });
       }
     });

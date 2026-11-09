@@ -147,13 +147,18 @@ impl DownloadEngine {
                 let _ = state.save_tasks().await;
                 return Err(e);
             }
+            let _ = state.save_tasks().await;
             return Ok(());
         }
 
         // Probe if total size or range capability unknown (with responsive cancellation support)
         let remote_info = tokio::select! {
-            _ = cancel_rx.changed() => {
-                return Err(anyhow!("Cancelled"));
+            res = cancel_rx.changed() => {
+                if res.is_ok() && *cancel_rx.borrow() {
+                    return Err(anyhow!("Cancelled"));
+                }
+                // If channel closed or not true, don't abort probe
+                std::future::pending::<Result<crate::prober::RemoteInfo, String>>().await
             }
             res = probe_url(&self.client, &task_url, Some(&task.headers), Some(&task.filename)) => {
                 res.map_err(|e| format!("Probe failed: {:#}", e))
@@ -556,8 +561,14 @@ impl DownloadEngine {
         state: AppState,
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<()> {
+        let is_googlevideo = url.contains("googlevideo.com") || url.contains("videoplayback");
         let mut headers = HeaderMap::new();
         for (k, v) in headers_map {
+            let k_lower = k.to_lowercase();
+            if k_lower == "host" || k_lower == "content-length" || k_lower == "origin" 
+               || k_lower.starts_with("sec-fetch-") {
+                continue;
+            }
             if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
                 headers.insert(name, val);
             }
@@ -573,16 +584,48 @@ impl DownloadEngine {
             }
         }
 
-        if url.contains("googlevideo.com") && !headers.contains_key(reqwest::header::REFERER) {
+        if is_googlevideo && !headers.contains_key(reqwest::header::REFERER) {
             headers.insert(
                 reqwest::header::REFERER,
                 HeaderValue::from_static("https://www.youtube.com/"),
             );
         }
 
-        let mut resp = self.client.get(url).headers(headers).send().await?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("Server returned HTTP {}", resp.status()));
+        // IDM Standard: Googlevideo endpoints require Range header even for single stream
+        if is_googlevideo && !headers.contains_key(reqwest::header::RANGE) {
+            headers.insert(reqwest::header::RANGE, HeaderValue::from_static("bytes=0-"));
+        }
+
+        let mut resp = self.client.get(url).headers(headers.clone()).send().await?;
+        let mut status = resp.status();
+        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+            // Google Video CDN node fallback
+            if status == reqwest::StatusCode::FORBIDDEN && is_googlevideo {
+                if let Ok(u) = url::Url::parse(url) {
+                    let mn = u.query_pairs().find(|(k, _)| k == "mn").map(|(_, v)| v.to_string());
+                    if let Some(mn_val) = mn {
+                        let servers: Vec<&str> = mn_val.split(',').collect();
+                        for srv in servers {
+                            let new_host = format!("{}.googlevideo.com", srv);
+                            if let Some(curr_h) = u.host_str() {
+                                if !curr_h.contains(srv) {
+                                    let fb_url = url.replace(curr_h, &new_host);
+                                    if let Ok(fb_resp) = self.client.get(&fb_url).headers(headers.clone()).send().await {
+                                        if fb_resp.status().is_success() || fb_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                                            resp = fb_resp;
+                                            status = resp.status();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(anyhow!("Server returned HTTP {}", status));
+            }
         }
         let mut downloaded: u64 = 0;
         let mut last_instant = Instant::now();
@@ -659,15 +702,21 @@ async fn run_segment_worker(
     };
 
     while current <= end && !stop.load(Ordering::Relaxed) {
-        let range_str = format!("bytes={}-{}", current, end);
         let mut req_headers = HeaderMap::new();
-        req_headers.insert(RANGE, HeaderValue::from_str(&range_str)?);
 
         for (k, v) in &headers_map {
+            let k_lower = k.to_lowercase();
+            if k_lower == "range" || k_lower == "host" || k_lower == "content-length" 
+               || k_lower == "origin" || k_lower.starts_with("sec-fetch-") {
+                continue;
+            }
             if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
                 req_headers.insert(name, val);
             }
         }
+
+        let range_str = format!("bytes={}-{}", current, end);
+        req_headers.insert(RANGE, HeaderValue::from_str(&range_str)?);
 
         if url.contains("googlevideo.com") && !req_headers.contains_key(reqwest::header::REFERER) {
             req_headers.insert(

@@ -8,46 +8,7 @@ use url::Url;
 /// so that multi-segment parallel HTTP Range requests can download the entire file.
 /// CRITICAL: Preserves all HMAC parameters signed in `sparams` (e.g. YouTube GoogleVideo).
 pub fn clean_media_url(raw_url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(raw_url) {
-        let is_gvs = parsed.host_str().map_or(false, |h| h.contains("googlevideo.com"));
-        let sparams = parsed
-            .query_pairs()
-            .find(|(k, _)| k == "sparams")
-            .map(|(_, v)| v.to_string())
-            .unwrap_or_default();
-        let sparams_list: Vec<&str> = sparams.split(',').collect();
-
-        let pairs: Vec<(String, String)> = parsed
-            .query_pairs()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect();
-        parsed.query_pairs_mut().clear();
-
-        for (k, v) in pairs {
-            let key = k.as_str();
-            // 1. Never delete parameters signed by Google Video HMAC
-            if is_gvs && sparams_list.contains(&key) {
-                parsed.query_pairs_mut().append_pair(&k, &v);
-                continue;
-            }
-
-            // 2. Facebook / DASH chunk range stripping
-            if key == "bytestart" || key == "byteend" {
-                continue;
-            }
-
-            // 3. Media streaming subsegment chunk params and SABR/UMP params
-            if key == "range" || key == "sq" || key == "frag" || key == "segment"
-                || key == "sabr" || key == "rqh" || key == "ump" || key == "len" || key == "begin" {
-                continue;
-            }
-
-            parsed.query_pairs_mut().append_pair(&k, &v);
-        }
-
-        return parsed.to_string();
-    }
-    raw_url.to_string()
+    crate::stream_engine::clean_stream_url(raw_url)
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +34,11 @@ pub async fn probe_url(
 
     if let Some(headers) = extra_headers {
         for (k, v) in headers {
+            let k_lower = k.to_lowercase();
+            if k_lower == "host" || k_lower == "content-length" || k_lower == "origin" 
+               || k_lower.starts_with("sec-fetch-") {
+                continue;
+            }
             if let (Ok(name), Ok(val)) = (k.parse::<reqwest::header::HeaderName>(), HeaderValue::from_str(v)) {
                 custom_headers.insert(name, val);
             }

@@ -147,6 +147,15 @@ impl IllusionApp {
             return;
         }
 
+        // Set status to Downloading immediately so UI and workers reflect active state
+        {
+            let mut list = self.state.tasks.write().unwrap();
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.status = TaskStatus::Downloading;
+                t.error_message = None;
+            }
+        }
+
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let engine = self.engine.clone();
         let state = self.state.clone();
@@ -225,7 +234,7 @@ impl eframe::App for IllusionApp {
 
             self.active_workers.retain(|id, _| {
                 if let Some(t) = tasks.iter().find(|t| &t.id == id) {
-                    t.status == TaskStatus::Downloading
+                    t.status == TaskStatus::Downloading || t.status == TaskStatus::Queued
                 } else {
                     false
                 }
