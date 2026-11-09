@@ -27,6 +27,10 @@ pub fn is_video_page_url(url: &str) -> bool {
         || lower.contains("pinterest.com/")
         || lower.contains("tiktok.com/")
         || lower.contains("vimeo.com/")
+        || lower.contains("dailymotion.com/")
+        || lower.contains("dai.ly/")
+        || lower.contains("vk.com/")
+        || lower.contains("reddit.com/")
 }
 
 pub async fn resolve_media_url(
@@ -36,10 +40,15 @@ pub async fn resolve_media_url(
     info!("Resolving media stream for video page: {}", page_url);
 
     // Format selection:
-    // Default to 18 (progressive 360p mp4) or best format under 360p, or user requested
-    let format_arg = preferred_format
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "18/best[height<=360]/best".to_string());
+    // Handle specific quality labels (1080p, 720p, 480p, 360p) or fallback to progressive 360p
+    let format_arg = match preferred_format {
+        Some(q) if q.contains("1080") => "best[height<=1080][ext=mp4]/best[height<=1080]/best".to_string(),
+        Some(q) if q.contains("720") => "22/best[height<=720][ext=mp4]/best[height<=720]/best".to_string(),
+        Some(q) if q.contains("480") => "best[height<=480][ext=mp4]/best[height<=480]/best".to_string(),
+        Some(q) if q.contains("360") => "18/best[height<=360][ext=mp4]/best[height<=360]/best".to_string(),
+        Some(fmt) if !fmt.is_empty() => fmt.to_string(),
+        _ => "18/best[height<=360]/best".to_string(),
+    };
 
     let mut cmd = Command::new("yt-dlp");
     cmd.args([

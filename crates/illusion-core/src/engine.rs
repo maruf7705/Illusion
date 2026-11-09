@@ -2,7 +2,7 @@ use crate::prober::{build_request_headers, probe_request};
 use crate::segment::{Segment, SegmentStatus};
 use crate::state::AppState;
 use crate::storage::DiskStorage;
-use crate::task::TaskStatus;
+use crate::task::{DownloadTask, TaskStatus};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use reqwest::header::{HeaderValue, RANGE};
@@ -59,6 +59,35 @@ pub struct DownloadEngine {
     pub rate_limiter: RateLimiter,
 }
 
+fn find_associated_page_url(task: &DownloadTask, primary_request: &crate::media::RequestContext) -> Option<String> {
+    if crate::resolver::is_video_page_url(&primary_request.url) {
+        return Some(primary_request.url.clone());
+    }
+    if let Some(ref r) = primary_request.referer {
+        if crate::resolver::is_video_page_url(r) {
+            return Some(r.clone());
+        }
+    }
+    if let Some(ref mc) = task.media_candidate {
+        if let Some(ref pu) = mc.page_url {
+            if crate::resolver::is_video_page_url(pu) {
+                return Some(pu.clone());
+            }
+        }
+        if let Some(ref r) = mc.primary.referer {
+            if crate::resolver::is_video_page_url(r) {
+                return Some(r.clone());
+            }
+        }
+    }
+    if let Some(r) = task.headers.get("referer").or_else(|| task.headers.get("Referer")) {
+        if crate::resolver::is_video_page_url(r) {
+            return Some(r.clone());
+        }
+    }
+    None
+}
+
 impl DownloadEngine {
     pub fn new(max_connections: usize) -> Self {
         let client = reqwest::Client::builder()
@@ -90,14 +119,76 @@ impl DownloadEngine {
         state: AppState,
         mut cancel_rx: watch::Receiver<bool>,
     ) -> Result<()> {
-        let task = {
+        let mut task = {
             let list = state.tasks.read().unwrap();
             list.iter().find(|t| t.id == task_id).cloned()
         }
         .ok_or_else(|| anyhow!("Task {} not found", task_id))?;
 
-        let primary_request = task.primary_request();
-        let task_url = primary_request.url.clone();
+        let mut primary_request = task.primary_request();
+        let mut task_url = primary_request.url.clone();
+
+        // 0. Auto-resolve video page URLs or browser-captured Web streams with raw n-challenges
+        if let Some(page_url) = find_associated_page_url(&task, &primary_request) {
+            let is_direct_page = crate::resolver::is_video_page_url(&task_url);
+            let is_web_googlevideo = task_url.contains("googlevideo.com")
+                && (task_url.contains("c=WEB") || task_url.contains("&n=") || task_url.contains("?n="));
+
+            if is_direct_page || is_web_googlevideo {
+                info!("Auto-resolving video page stream: {}", page_url);
+                let quality_pref = task.media_candidate.as_ref().and_then(|c| c.quality.as_deref());
+                match crate::resolver::resolve_media_url(&page_url, quality_pref).await {
+                    Ok(resolved) => {
+                        info!("Successfully resolved video stream: {} -> {}", page_url, resolved.stream_url);
+                        task_url = resolved.stream_url.clone();
+                        primary_request.url = resolved.stream_url.clone();
+                        for (k, v) in resolved.headers {
+                            primary_request.headers.insert(k, v);
+                        }
+                        if let Some(ua) = resolved.user_agent {
+                            primary_request.user_agent = Some(ua);
+                        }
+                        if task.total_size.is_none() {
+                            task.total_size = resolved.total_size;
+                        }
+                        if let Some(audio) = resolved.audio_url {
+                            task.audio_url = Some(audio);
+                        }
+                        let is_generic_filename = task.filename.is_empty()
+                            || task.filename == "download"
+                            || task.filename.starts_with("watch_")
+                            || task.filename.starts_with("Facebook_")
+                            || task.filename.starts_with("Facebook.mp4")
+                            || task.filename.starts_with("Twitter_")
+                            || task.filename.contains("videoplayback");
+                        if is_generic_filename {
+                            task.filename = resolved.filename.clone();
+                            if let Some(parent) = task.save_path.parent() {
+                                task.save_path = parent.join(&resolved.filename);
+                            }
+                        }
+                        // Sync updated info to state
+                        {
+                            let mut list = state.tasks.write().unwrap();
+                            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                                t.url = task_url.clone();
+                                t.filename = task.filename.clone();
+                                t.save_path = task.save_path.clone();
+                                t.total_size = task.total_size;
+                                t.audio_url = task.audio_url.clone();
+                                t.headers = primary_request.headers.clone();
+                                t.user_agent = primary_request.user_agent.clone();
+                            }
+                        }
+                        let _ = state.save_tasks().await;
+                    }
+                    Err(e) => {
+                        warn!("Stream resolver note: {:#}", e);
+                    }
+                }
+            }
+        }
+
         info!("Starting download for task: {} ({})", task.filename, task_url);
 
         // Update task status to Downloading
@@ -199,15 +290,74 @@ impl DownloadEngine {
                 (info.total_size, info.accept_ranges)
             }
             Err(e) => {
-                {
-                    let mut list = state.tasks.write().unwrap();
-                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                        t.status = TaskStatus::Error;
-                        t.error_message = Some(e.clone());
+                // If probe failed (e.g. 403 Forbidden or HTML returned), attempt recovery via associated page URL
+                let mut recovered = None;
+                if let Some(page_url) = find_associated_page_url(&task, &primary_request) {
+                    info!("Probe failed ({:#}). Attempting recovery via page resolver: {}", e, page_url);
+                    let quality_pref = task.media_candidate.as_ref().and_then(|c| c.quality.as_deref());
+                    if let Ok(resolved) = crate::resolver::resolve_media_url(&page_url, quality_pref).await {
+                        task_url = resolved.stream_url.clone();
+                        primary_request.url = resolved.stream_url.clone();
+                        for (k, v) in resolved.headers {
+                            primary_request.headers.insert(k, v);
+                        }
+                        if let Some(ua) = resolved.user_agent {
+                            primary_request.user_agent = Some(ua);
+                        }
+                        if task.total_size.is_none() {
+                            task.total_size = resolved.total_size;
+                        }
+                        if let Some(audio) = resolved.audio_url {
+                            task.audio_url = Some(audio);
+                        }
+                        let is_generic = task.filename.is_empty()
+                            || task.filename == "download"
+                            || task.filename.starts_with("watch_")
+                            || task.filename.starts_with("Facebook_")
+                            || task.filename.starts_with("Facebook.mp4")
+                            || task.filename.contains("videoplayback");
+                        if is_generic {
+                            task.filename = resolved.filename.clone();
+                            if let Some(parent) = task.save_path.parent() {
+                                task.save_path = parent.join(&resolved.filename);
+                            }
+                        }
+                        // Re-probe with new stream
+                        if let Ok(info) = probe_request(&self.client, &primary_request, Some(&task.filename)).await {
+                            recovered = Some((info.total_size.or(resolved.total_size), info.accept_ranges));
+                        } else if let Some(size) = resolved.total_size {
+                            recovered = Some((Some(size), true));
+                        }
                     }
                 }
-                let _ = state.save_tasks().await;
-                return Err(anyhow!(e));
+
+                if let Some((rec_size, rec_ranges)) = recovered {
+                    {
+                        let mut list = state.tasks.write().unwrap();
+                        if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                            t.url = task_url.clone();
+                            t.filename = task.filename.clone();
+                            t.save_path = task.save_path.clone();
+                            t.total_size = rec_size;
+                            t.audio_url = task.audio_url.clone();
+                            t.headers = primary_request.headers.clone();
+                            t.user_agent = primary_request.user_agent.clone();
+                            t.error_message = None;
+                        }
+                    }
+                    let _ = state.save_tasks().await;
+                    (rec_size, rec_ranges)
+                } else {
+                    {
+                        let mut list = state.tasks.write().unwrap();
+                        if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                            t.status = TaskStatus::Error;
+                            t.error_message = Some(e.clone());
+                        }
+                    }
+                    let _ = state.save_tasks().await;
+                    return Err(anyhow!(e));
+                }
             }
         };
 
