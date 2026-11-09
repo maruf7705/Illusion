@@ -96,7 +96,12 @@ impl MediaCandidate {
 
     pub fn expected_size(&self) -> Option<u64> {
         match (&self.primary.content_length, &self.audio) {
-            (Some(primary), Some(audio)) => Some(primary.saturating_add(audio.content_length.unwrap_or(0))),
+            // A paired download has no meaningful final size until both
+            // independently captured responses reported a size.  Reporting a
+            // partial number here is worse than reporting "unknown".
+            (Some(primary), Some(audio)) => audio
+                .content_length
+                .map(|audio_size| primary.saturating_add(audio_size)),
             (Some(primary), None) => Some(*primary),
             (None, Some(audio)) => audio.content_length,
             (None, None) => None,

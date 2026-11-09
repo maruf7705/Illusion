@@ -2,12 +2,14 @@
 // IDM-Grade Stream Handlers: Dual-Stream Adaptive Video+Audio Muxing, HLS (.m3u8), MPEG-DASH (.mpd), and Direct Byte-Range
 // Zero yt-dlp / Zero Python / Pure Native Concurrency
 
+use crate::media::MediaCandidateKind;
+use crate::prober::build_request_headers;
 use crate::state::AppState;
 use crate::task::{DownloadTask, TaskStatus};
 use anyhow::{anyhow, Result};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
+use reqwest::header::{HeaderMap, HeaderValue, RANGE};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
@@ -26,83 +28,27 @@ pub enum StreamDispatchMode {
     DashSegmented,
     /// Mode C: Separated Video + Audio adaptive streams (YouTube 1080p+, Facebook DASH, Vimeo adaptive)
     SeparatedVideoAudioMux,
+    /// The browser identified a protected or unavailable playback source.
+    ProtectedOrUnsupported,
 }
 
 pub struct StreamEngine;
 
-fn strip_query_param(url: &str, param: &str) -> String {
-    let mut res = url.to_string();
-    let p_amp = format!("&{}=", param);
-    let p_q = format!("?{}=", param);
-
-    // Replace &param=val
-    while let Some(pos) = res.find(&p_amp) {
-        let rest = &res[pos + p_amp.len()..];
-        let end = rest.find('&').map(|e| pos + p_amp.len() + e).unwrap_or(res.len());
-        res.replace_range(pos..end, "");
-    }
-
-    // Replace ?param=val
-    if let Some(pos) = res.find(&p_q) {
-        let rest = &res[pos + p_q.len()..];
-        if let Some(amp_idx) = rest.find('&') {
-            let end = pos + p_q.len() + amp_idx;
-            // ?param=val&other -> ?other
-            res.replace_range(pos + 1..end + 1, "");
-        } else {
-            // ?param=val at end of url
-            res.truncate(pos);
-        }
-    }
-    res
-}
-
 pub fn clean_stream_url(raw_url: &str) -> String {
-    let lower = raw_url.to_lowercase();
-    if lower.contains("googlevideo.com") || lower.contains("videoplayback") {
-        // Extract sparams to know what is protected by HMAC
-        let sparams = if let Some(idx) = raw_url.find("sparams=") {
-            let rest = &raw_url[idx + 8..];
-            let end = rest.find('&').unwrap_or(rest.len());
-            rest[..end].to_string()
-        } else {
-            String::new()
-        };
-        let sparams_list: Vec<&str> = sparams.split("%2C").flat_map(|s| s.split(',')).collect();
-
-        let mut url = raw_url.to_string();
-
-        // 1. Strip non-signed range and slicing params (IDM VA 0x004277c0)
-        let strip_candidates = ["range", "begin", "ump", "len", "sq", "segment", "frag", "sabr", "rqh"];
-        for param in strip_candidates {
-            if !sparams_list.contains(&param) {
-                url = strip_query_param(&url, param);
-            }
-        }
-        return url;
-    }
-
-    if lower.contains("fbcdn.net") || lower.contains("cdninstagram.com") || lower.contains("facebook.com") {
-        let mut url = raw_url.to_string();
-        url = strip_query_param(&url, "bytestart");
-        url = strip_query_param(&url, "byteend");
-        return url;
-    }
-
+    // The captured URL is a signed request capability.  Parameters such as
+    // `range` and `ump` must not be rewritten; our independent HTTP Range
+    // header is the only range control the downloader adds.
     raw_url.to_string()
 }
 
-/// Resolves a relative URL against a base URL, preserving query parameters (e.g. auth tokens, signatures)
-/// from the base URL if the relative reference doesn't define its own query string.
+/// Resolves a manifest child using standard relative URL resolution.  A
+/// parent playlist query is not automatically valid for a child request.
 pub fn resolve_url_preserving_query(base: &Url, rel: &str) -> String {
     let trimmed = rel.trim();
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
         return trimmed.to_string();
     }
-    if let Ok(mut resolved) = base.join(trimmed) {
-        if resolved.query().is_none() && base.query().is_some() {
-            resolved.set_query(base.query());
-        }
+    if let Ok(resolved) = base.join(trimmed) {
         resolved.to_string()
     } else {
         trimmed.to_string()
@@ -225,6 +171,19 @@ struct DashAdaptationSetData {
 
 impl StreamEngine {
     pub fn classify_task(task: &DownloadTask) -> StreamDispatchMode {
+        // Candidate kind is the browser/native protocol.  URL heuristics are
+        // retained only for tasks written by older extension versions.
+        if task.media_candidate.is_some() {
+            return match task.candidate_kind() {
+                MediaCandidateKind::Progressive => StreamDispatchMode::DirectByteRange,
+                MediaCandidateKind::PairedAudioVideo => StreamDispatchMode::SeparatedVideoAudioMux,
+                MediaCandidateKind::HlsManifest => StreamDispatchMode::HlsSegmented,
+                MediaCandidateKind::DashManifest => StreamDispatchMode::DashSegmented,
+                MediaCandidateKind::ProtectedOrUnsupported => {
+                    StreamDispatchMode::ProtectedOrUnsupported
+                }
+            };
+        }
         let url_lower = task.url.to_lowercase();
         let audio_url_lower = task.audio_url.as_ref().map(|s| s.to_lowercase());
 

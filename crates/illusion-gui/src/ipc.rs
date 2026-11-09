@@ -1,5 +1,5 @@
 use eframe::egui;
-use illusion_core::{AppState, DownloadTask};
+use illusion_core::{AppState, DownloadTask, MediaCandidate, MediaCandidateKind, RequestContext};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -23,10 +23,14 @@ pub struct IpcDownloadRequest {
     pub filename: Option<String>,
     pub referer: Option<String>,
     pub cookies: Option<String>,
+    #[serde(alias = "userAgent")]
     pub user_agent: Option<String>,
+    #[serde(alias = "audioUrl")]
     pub audio_url: Option<String>,
     pub quality: Option<String>,
     pub headers: Option<HashMap<String, String>>,
+    #[serde(default, alias = "mediaCandidate")]
+    pub media_candidate: Option<MediaCandidate>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,6 +39,99 @@ pub struct IpcResponse {
     pub message: Option<String>,
     pub task_id: Option<String>,
     pub filename: Option<String>,
+}
+
+pub fn build_download_task(
+    request: IpcDownloadRequest,
+    download_dir: PathBuf,
+) -> Result<DownloadTask, String> {
+    let request_url = request.url.clone().unwrap_or_default();
+    let request_headers = request.headers.clone().unwrap_or_default();
+    let request_referer = request.referer.clone();
+    let request_cookies = request.cookies.clone();
+    let request_user_agent = request.user_agent.clone();
+    let request_audio_url = request.audio_url.clone();
+    let request_quality = request.quality.clone();
+    let mut candidate = request.media_candidate.unwrap_or_else(|| {
+        let mut headers = request_headers.clone();
+        if let Some(referer) = request_referer.as_ref().filter(|value| !value.is_empty()) {
+            headers.entry("referer".to_string()).or_insert_with(|| referer.clone());
+        }
+        MediaCandidate {
+            id: None,
+            kind: if request_audio_url.is_some() {
+                MediaCandidateKind::PairedAudioVideo
+            } else {
+                MediaCandidateKind::Progressive
+            },
+            page_url: request_referer.clone(),
+            primary: RequestContext {
+                url: request_url.clone(),
+                headers,
+                cookies: request_cookies.clone(),
+                user_agent: request_user_agent.clone(),
+                referer: request_referer.clone(),
+                ..RequestContext::default()
+            },
+            audio: request_audio_url.clone().map(|url| RequestContext {
+                url,
+                headers: HashMap::new(),
+                cookies: request_cookies.clone(),
+                user_agent: request_user_agent.clone(),
+                referer: request_referer.clone(),
+                ..RequestContext::default()
+            }),
+            quality: request_quality.clone(),
+            codecs: None,
+            unsupported_reason: None,
+        }
+    });
+
+    if candidate.primary.url.trim().is_empty() {
+        return Err("Missing URL in download request".to_string());
+    }
+    if candidate.kind == MediaCandidateKind::ProtectedOrUnsupported {
+        return Err(candidate
+            .unsupported_reason
+            .unwrap_or_else(|| "This protected media stream cannot be downloaded".to_string()));
+    }
+
+    let mut legacy_headers = request_headers;
+    if let Some(referer) = request_referer.as_ref().filter(|value| !value.is_empty()) {
+        legacy_headers.entry("referer".to_string()).or_insert_with(|| referer.clone());
+    }
+    for (name, value) in legacy_headers {
+        candidate.primary.headers.entry(name).or_insert(value);
+    }
+    if candidate.primary.cookies.is_none() {
+        candidate.primary.cookies = request_cookies;
+    }
+    if candidate.primary.user_agent.is_none() {
+        candidate.primary.user_agent = request_user_agent;
+    }
+    if candidate.primary.referer.is_none() {
+        candidate.primary.referer = request_referer;
+    }
+    if candidate.quality.is_none() {
+        candidate.quality = request_quality;
+    }
+
+    let mut filename = request.filename.unwrap_or_default();
+    if filename.is_empty() {
+        filename = candidate
+            .primary
+            .url
+            .split('/')
+            .next_back()
+            .unwrap_or("download")
+            .split('?')
+            .next()
+            .unwrap_or("download")
+            .to_string();
+    }
+    filename = illusion_core::prober::sanitize_filename(&filename);
+    let save_path = download_dir.join(&filename);
+    Ok(DownloadTask::from_media_candidate(candidate, filename, save_path))
 }
 
 fn get_user_id() -> u32 {
@@ -145,32 +242,8 @@ pub fn start_ipc_server(
                                         return;
                                     }
 
-                                    if let Some(raw_url) = req.url {
-                                        let url = illusion_core::prober::clean_media_url(&raw_url);
-                                        let mut filename = req.filename.unwrap_or_default();
-                                        if filename.is_empty() {
-                                            filename = url.split('/').last().unwrap_or("download").to_string();
-                                        }
-                                        filename = illusion_core::prober::sanitize_filename(&filename);
-
-                                        let mut headers = req.headers.unwrap_or_default();
-                                        if let Some(ref r) = req.referer {
-                                            headers.insert("referer".to_string(), r.clone());
-                                        }
-
-                                        let save_path = state.default_download_dir.join(&filename);
-                                        let mut task = DownloadTask::new(
-                                            url,
-                                            filename.clone(),
-                                            save_path,
-                                            None,
-                                            headers,
-                                            req.cookies,
-                                            req.user_agent,
-                                        );
-                                        task.audio_url = req.audio_url.map(|a| illusion_core::prober::clean_media_url(&a));
-                                        task.quality = req.quality;
-
+                                    if let Ok(task) = build_download_task(req, state.default_download_dir.clone()) {
+                                        let filename = task.filename.clone();
                                         let task_id = task.id.clone();
                                         state.add_task(task).await;
 
@@ -339,32 +412,8 @@ async fn handle_http_client(
         }
 
         if let Ok(req) = serde_json::from_slice::<IpcDownloadRequest>(&body_bytes) {
-            if let Some(raw_url) = req.url {
-                let url = illusion_core::prober::clean_media_url(&raw_url);
-                let mut filename = req.filename.unwrap_or_default();
-                if filename.is_empty() {
-                    filename = url.split('/').last().unwrap_or("download").to_string();
-                }
-                filename = illusion_core::prober::sanitize_filename(&filename);
-
-                let mut headers = req.headers.unwrap_or_default();
-                if let Some(ref r) = req.referer {
-                    headers.insert("referer".to_string(), r.clone());
-                }
-
-                let save_path = state.default_download_dir.join(&filename);
-                let mut task = DownloadTask::new(
-                    url,
-                    filename.clone(),
-                    save_path,
-                    None,
-                    headers,
-                    req.cookies,
-                    req.user_agent,
-                );
-                task.audio_url = req.audio_url.map(|a| illusion_core::prober::clean_media_url(&a));
-                task.quality = req.quality;
-
+            if let Ok(task) = build_download_task(req, state.default_download_dir.clone()) {
+                let filename = task.filename.clone();
                 let task_id = task.id.clone();
                 state.add_task(task).await;
 

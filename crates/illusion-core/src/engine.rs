@@ -1,11 +1,11 @@
-use crate::prober::probe_url;
+use crate::prober::{build_request_headers, probe_request};
 use crate::segment::{Segment, SegmentStatus};
 use crate::state::AppState;
 use crate::storage::DiskStorage;
 use crate::task::TaskStatus;
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE, USER_AGENT};
+use reqwest::header::{HeaderValue, RANGE};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -95,9 +95,9 @@ impl DownloadEngine {
         }
         .ok_or_else(|| anyhow!("Task {} not found", task_id))?;
 
-        info!("Starting download for task: {} ({})", task.filename, task.url);
-
-        let task_url = crate::prober::clean_media_url(&task.url);
+        let primary_request = task.primary_request();
+        let task_url = primary_request.url.clone();
+        info!("Starting download for task: {} ({})", task.filename, task_url);
 
         // Update task status to Downloading
         {
@@ -141,6 +141,13 @@ impl DownloadEngine {
                 )
                 .await)
             }
+            crate::stream_engine::StreamDispatchMode::ProtectedOrUnsupported => {
+                Some(Err(anyhow!(task
+                    .media_candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.unsupported_reason.clone())
+                    .unwrap_or_else(|| "This media is protected or unsupported".to_string()))))
+            }
             crate::stream_engine::StreamDispatchMode::DirectByteRange => None,
         };
 
@@ -170,7 +177,7 @@ impl DownloadEngine {
                 // If channel closed or not true, don't abort probe
                 std::future::pending::<Result<crate::prober::RemoteInfo, String>>().await
             }
-            res = probe_url(&self.client, &task_url, Some(&task.headers), Some(&task.filename)) => {
+            res = probe_request(&self.client, &primary_request, Some(&task.filename)) => {
                 res.map_err(|e| format!("Probe failed: {:#}", e))
             }
         };
@@ -204,7 +211,7 @@ impl DownloadEngine {
         };
 
         // Ensure user agent
-        let user_agent = task.user_agent.clone().or_else(|| {
+        let user_agent = primary_request.user_agent.clone().or_else(|| {
             Some("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36".to_string())
         });
 
@@ -216,8 +223,8 @@ impl DownloadEngine {
                 &task_id,
                 &task_url,
                 total_size.unwrap(),
-                &task.headers,
-                task.cookies.as_deref(),
+                &primary_request.normalized_headers(),
+                primary_request.cookies.as_deref(),
                 user_agent.as_deref(),
                 storage.clone(),
                 state.clone(),
@@ -230,8 +237,8 @@ impl DownloadEngine {
                     self.download_single_stream(
                         &task_id,
                         &task_url,
-                        &task.headers,
-                        task.cookies.as_deref(),
+                        &primary_request.normalized_headers(),
+                        primary_request.cookies.as_deref(),
                         user_agent.as_deref(),
                         storage.clone(),
                         state.clone(),
@@ -244,8 +251,8 @@ impl DownloadEngine {
             self.download_single_stream(
                 &task_id,
                 &task_url,
-                &task.headers,
-                task.cookies.as_deref(),
+                &primary_request.normalized_headers(),
+                primary_request.cookies.as_deref(),
                 user_agent.as_deref(),
                 storage.clone(),
                 state.clone(),
@@ -256,37 +263,31 @@ impl DownloadEngine {
 
         match res {
             Ok(_) => {
-                let _ = storage.sync_all().await;
-
-                // Adaptive Audio+Video Muxer (IDM-grade stream combiner)
-                if let Some(ref a_url) = task.audio_url {
-                    let audio_tmp_path = task.save_path.with_extension("audio_tmp.m4a");
-                    let video_tmp_path = task.save_path.with_extension("video_tmp.mp4");
-
-                    if let Ok(_) = tokio::fs::rename(&task.save_path, &video_tmp_path).await {
-                        info!("Downloading separate audio track for adaptive stream muxing...");
-                        if let Ok(audio_storage) = DiskStorage::create_or_open(&audio_tmp_path, None).await {
-                            let a_res = self.download_single_stream(
-                                &task_id,
-                                a_url,
-                                &task.headers,
-                                task.cookies.as_deref(),
-                                user_agent.as_deref(),
-                                audio_storage.clone(),
-                                state.clone(),
-                                &mut cancel_rx,
-                            ).await;
-                            let _ = audio_storage.sync_all().await;
-
-                            if a_res.is_ok() {
-                                info!("Multiplexing video + audio with FFmpeg...");
-                                let _ = crate::muxer::mux_video_and_audio(&video_tmp_path, &audio_tmp_path, &task.save_path).await;
-                            } else {
-                                let _ = tokio::fs::rename(&video_tmp_path, &task.save_path).await;
-                            }
+                let written_size = {
+                    let list = state.tasks.read().unwrap();
+                    list.iter()
+                        .find(|download| download.id == task_id)
+                        .map(|download| download.downloaded_size)
+                        .unwrap_or(0)
+                };
+                if let Some(expected) = total_size {
+                    if written_size != expected {
+                        let message = format!(
+                            "Incomplete response: expected {} bytes, wrote {} bytes",
+                            expected, written_size
+                        );
+                        let mut list = state.tasks.write().unwrap();
+                        if let Some(download) = list.iter_mut().find(|download| download.id == task_id) {
+                            download.status = TaskStatus::Error;
+                            download.error_message = Some(message.clone());
+                            download.speed = 0.0;
                         }
+                        drop(list);
+                        let _ = state.save_tasks().await;
+                        return Err(anyhow!(message));
                     }
                 }
+                let _ = storage.sync_all().await;
 
                 let meta = tokio::fs::metadata(&task.save_path).await.ok();
                 let actual_bytes = meta.map(|m| m.len()).unwrap_or(0);
@@ -571,78 +572,20 @@ impl DownloadEngine {
         state: AppState,
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<()> {
-        let clean_url = crate::stream_engine::clean_stream_url(url);
-        let is_googlevideo = clean_url.contains("googlevideo.com") || clean_url.contains("videoplayback");
-        let mut headers = HeaderMap::new();
-        for (k, v) in headers_map {
-            let k_lower = k.to_lowercase();
-            if k_lower == "host" || k_lower == "content-length" || k_lower == "origin" 
-               || k_lower.starts_with("sec-fetch-") || k_lower.starts_with("sec-ch-") {
-                continue;
-            }
-            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
-                headers.insert(name, val);
-            }
-        }
-        if let Some(ua) = user_agent {
-            if let Ok(val) = HeaderValue::from_str(ua) {
-                headers.insert(USER_AGENT, val);
-            }
-        }
-        if !headers.contains_key(USER_AGENT) {
-            headers.insert(
-                USER_AGENT,
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-            );
-        }
-        if let Some(c) = cookies {
-            if let Ok(val) = HeaderValue::from_str(c) {
-                headers.insert("cookie", val);
-            }
-        }
-
-        if is_googlevideo && !headers.contains_key(reqwest::header::REFERER) {
-            headers.insert(
-                reqwest::header::REFERER,
-                HeaderValue::from_static("https://www.youtube.com/"),
-            );
-        }
-
-        // IDM Standard: Googlevideo endpoints require Range header even for single stream
-        if is_googlevideo && !headers.contains_key(reqwest::header::RANGE) {
-            headers.insert(reqwest::header::RANGE, HeaderValue::from_static("bytes=0-"));
-        }
-
-        let mut resp = self.client.get(&clean_url).headers(headers.clone()).send().await?;
-        let mut status = resp.status();
+        let clean_url = url;
+        let headers = build_request_headers(headers_map, cookies, user_agent);
+        let mut resp = self.client.get(clean_url).headers(headers).send().await?;
+        let status = resp.status();
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            // Google Video CDN node fallback
-            if status == reqwest::StatusCode::FORBIDDEN && is_googlevideo {
-                if let Ok(u) = url::Url::parse(&clean_url) {
-                    let mn = u.query_pairs().find(|(k, _)| k == "mn").map(|(_, v)| v.to_string());
-                    if let Some(mn_val) = mn {
-                        let servers: Vec<&str> = mn_val.split(',').collect();
-                        for srv in servers {
-                            let new_host = format!("{}.googlevideo.com", srv);
-                            if let Some(curr_h) = u.host_str() {
-                                if !curr_h.contains(srv) {
-                                    let fb_url = clean_url.replace(curr_h, &new_host);
-                                    if let Ok(fb_resp) = self.client.get(&fb_url).headers(headers.clone()).send().await {
-                                        if fb_resp.status().is_success() || fb_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                                            resp = fb_resp;
-                                            status = resp.status();
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-                return Err(anyhow!("Server returned HTTP {}", status));
-            }
+            return Err(anyhow!("Server returned HTTP {}", status));
+        }
+        if resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().starts_with("text/html"))
+        {
+            return Err(anyhow!("Server returned HTML instead of media"));
         }
         let mut downloaded: u64 = 0;
         let mut last_instant = Instant::now();
@@ -694,6 +637,14 @@ impl DownloadEngine {
     }
 }
 
+fn content_range_starts_at(header: Option<&str>, expected_start: u64) -> bool {
+    header
+        .and_then(|value| value.strip_prefix("bytes "))
+        .and_then(|value| value.split_once('-'))
+        .and_then(|(start, _)| start.parse::<u64>().ok())
+        == Some(expected_start)
+}
+
 async fn run_segment_worker(
     client: reqwest::Client,
     url: String,
@@ -718,47 +669,13 @@ async fn run_segment_worker(
         }
     };
 
-    let clean_url = crate::stream_engine::clean_stream_url(&url);
+    let clean_url = url;
 
     while current <= end && !stop.load(Ordering::Relaxed) {
-        let mut req_headers = HeaderMap::new();
-
-        for (k, v) in &headers_map {
-            let k_lower = k.to_lowercase();
-            if k_lower == "range" || k_lower == "host" || k_lower == "content-length" 
-               || k_lower == "origin" || k_lower.starts_with("sec-fetch-") || k_lower.starts_with("sec-ch-") {
-                continue;
-            }
-            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
-                req_headers.insert(name, val);
-            }
-        }
+        let mut req_headers = build_request_headers(&headers_map, cookies.as_deref(), user_agent.as_deref());
 
         let range_str = format!("bytes={}-{}", current, end);
         req_headers.insert(RANGE, HeaderValue::from_str(&range_str)?);
-
-        if clean_url.contains("googlevideo.com") && !req_headers.contains_key(reqwest::header::REFERER) {
-            req_headers.insert(
-                reqwest::header::REFERER,
-                HeaderValue::from_static("https://www.youtube.com/"),
-            );
-        }
-        if let Some(ref ua) = user_agent {
-            if let Ok(val) = HeaderValue::from_str(ua) {
-                req_headers.insert(USER_AGENT, val);
-            }
-        }
-        if !req_headers.contains_key(USER_AGENT) {
-            req_headers.insert(
-                USER_AGENT,
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-            );
-        }
-        if let Some(ref c) = cookies {
-            if let Ok(val) = HeaderValue::from_str(c) {
-                req_headers.insert("cookie", val);
-            }
-        }
 
         let mut retry_count = 0;
         let resp = loop {
@@ -770,7 +687,12 @@ async fn run_segment_worker(
             }
 
             match client.get(&clean_url).headers(req_headers.clone()).send().await {
-                Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT || (current == 0 && r.status() == reqwest::StatusCode::OK) => break r,
+                Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT
+                    && content_range_starts_at(r.headers().get(reqwest::header::CONTENT_RANGE).and_then(|value| value.to_str().ok()), current) => break r,
+                Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    return Err(anyhow!("Segment {} returned a mismatched Content-Range", seg_id));
+                }
+                Ok(r) if current == 0 && r.status() == reqwest::StatusCode::OK => break r,
                 Ok(r) if r.status() == reqwest::StatusCode::OK && current > 0 => {
                     // Server does not support byte-range slicing (returned 200 OK for sub-range)
                     return Err(anyhow!("Server does not support byte ranges (returned 200 OK)"));
@@ -802,6 +724,12 @@ async fn run_segment_worker(
                 }
             };
 
+            let remaining = (end - current + 1) as usize;
+            let chunk = if chunk.len() > remaining {
+                chunk.slice(..remaining)
+            } else {
+                chunk
+            };
             let len = chunk.len() as u64;
             storage.write_at(current, chunk.to_vec()).await?;
             current += len;

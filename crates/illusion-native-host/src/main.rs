@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use illusion_core::{AppState, DownloadTask};
+use illusion_core::{AppState, DownloadTask, MediaCandidate, MediaCandidateKind, RequestContext};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
@@ -21,9 +21,12 @@ struct NativeMessage {
     referer: Option<String>,
     cookies: Option<String>,
     user_agent: Option<String>,
+    #[serde(alias = "audioUrl")]
     audio_url: Option<String>,
     quality: Option<String>,
     headers: Option<HashMap<String, String>>,
+    #[serde(default, alias = "mediaCandidate")]
+    media_candidate: Option<MediaCandidate>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +35,95 @@ struct NativeResponse {
     message: Option<String>,
     task_id: Option<String>,
     filename: Option<String>,
+}
+
+fn build_download_task(msg: NativeMessage, download_dir: PathBuf) -> Result<DownloadTask> {
+    let request_url = msg.url.clone().unwrap_or_default();
+    let request_headers = msg.headers.clone().unwrap_or_default();
+    let request_referer = msg.referer.clone();
+    let request_cookies = msg.cookies.clone();
+    let request_user_agent = msg.user_agent.clone();
+    let request_audio_url = msg.audio_url.clone();
+    let request_quality = msg.quality.clone();
+
+    let mut candidate = msg.media_candidate.unwrap_or_else(|| {
+        let mut headers = request_headers.clone();
+        if let Some(referer) = request_referer.as_ref().filter(|value| !value.is_empty()) {
+            headers.entry("referer".to_string()).or_insert_with(|| referer.clone());
+        }
+        MediaCandidate {
+            id: None,
+            kind: if request_audio_url.is_some() {
+                MediaCandidateKind::PairedAudioVideo
+            } else {
+                MediaCandidateKind::Progressive
+            },
+            page_url: request_referer.clone(),
+            primary: RequestContext {
+                url: request_url.clone(),
+                headers,
+                cookies: request_cookies.clone(),
+                user_agent: request_user_agent.clone(),
+                referer: request_referer.clone(),
+                ..RequestContext::default()
+            },
+            audio: request_audio_url.clone().map(|url| RequestContext {
+                url,
+                headers: HashMap::new(),
+                cookies: request_cookies.clone(),
+                user_agent: request_user_agent.clone(),
+                referer: request_referer.clone(),
+                ..RequestContext::default()
+            }),
+            quality: request_quality.clone(),
+            codecs: None,
+            unsupported_reason: None,
+        }
+    });
+
+    if candidate.primary.url.trim().is_empty() {
+        return Err(anyhow!("Missing URL in download request"));
+    }
+    if candidate.kind == MediaCandidateKind::ProtectedOrUnsupported {
+        return Err(anyhow!(candidate.unsupported_reason.unwrap_or_else(|| {
+            "This protected media stream cannot be downloaded".to_string()
+        })));
+    }
+    for (name, value) in request_headers {
+        candidate.primary.headers.entry(name).or_insert(value);
+    }
+    if candidate.primary.cookies.is_none() {
+        candidate.primary.cookies = request_cookies;
+    }
+    if candidate.primary.user_agent.is_none() {
+        candidate.primary.user_agent = request_user_agent;
+    }
+    if candidate.primary.referer.is_none() {
+        candidate.primary.referer = request_referer;
+    }
+    if candidate.quality.is_none() {
+        candidate.quality = request_quality;
+    }
+
+    let mut filename = msg.filename.unwrap_or_default();
+    if filename.is_empty() {
+        filename = candidate
+            .primary
+            .url
+            .split('/')
+            .next_back()
+            .unwrap_or("download")
+            .split('?')
+            .next()
+            .unwrap_or("download")
+            .to_string();
+    }
+    filename = illusion_core::prober::sanitize_filename(&filename);
+    Ok(DownloadTask::from_media_candidate(
+        candidate,
+        filename.clone(),
+        download_dir.join(filename),
+    ))
 }
 
 fn get_user_id() -> u32 {
@@ -152,30 +244,9 @@ async fn main() -> Result<()> {
                 let _ = write_response(&mut writer, &resp);
             }
             "add_download" => {
-                if let Some(url) = msg.url {
-                    let mut filename = msg.filename.unwrap_or_default();
-                    if filename.is_empty() {
-                        filename = url.split('/').last().unwrap_or("download").to_string();
-                    }
-                    filename = illusion_core::prober::sanitize_filename(&filename);
-
-                    let mut headers = msg.headers.unwrap_or_default();
-                    if let Some(r) = msg.referer {
-                        headers.insert("referer".to_string(), r);
-                    }
-
-                    let save_path = state.default_download_dir.join(&filename);
-                    let mut task = DownloadTask::new(
-                        url,
-                        filename.clone(),
-                        save_path,
-                        None,
-                        headers,
-                        msg.cookies,
-                        msg.user_agent,
-                    );
-                    task.audio_url = msg.audio_url;
-                    task.quality = msg.quality;
+                match build_download_task(msg, state.default_download_dir.clone()) {
+                    Ok(task) => {
+                    let filename = task.filename.clone();
                     let task_id = task.id.clone();
                     state.add_task(task).await;
 
@@ -228,14 +299,16 @@ async fn main() -> Result<()> {
                         filename: Some(filename),
                     };
                     let _ = write_response(&mut writer, &resp);
-                } else {
+                    }
+                    Err(error) => {
                     let resp = NativeResponse {
                         status: "error".to_string(),
-                        message: Some("Missing URL in download request".to_string()),
+                        message: Some(error.to_string()),
                         task_id: None,
                         filename: None,
                     };
                     let _ = write_response(&mut writer, &resp);
+                    }
                 }
             }
             _ => {
