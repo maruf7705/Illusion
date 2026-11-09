@@ -26,6 +26,15 @@ for root in "${source_root}" "${firefox_root}"; do
   node -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "${root}/manifest.json"
 done
 
+node -e '
+  const fs = require("fs");
+  const source = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const firefox = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  if (source.version !== firefox.version) {
+    throw new Error(`extension manifest versions differ: ${source.version} != ${firefox.version}`);
+  }
+' "${source_root}/manifest.json" "${firefox_root}/manifest.json"
+
 xpi_tmp=$(mktemp "${firefox_root}/.illusion-downloader.XXXXXX.xpi")
 trap 'rm -f "${xpi_tmp}"' EXIT
 (

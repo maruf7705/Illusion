@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Illusion Download Integration (Firefox & Zen)",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "description": "IDM-grade video/audio sniffer and multi-segment download acceleration for Mozilla Firefox & Zen Browser.",
   "browser_specific_settings": {
     "gecko": {

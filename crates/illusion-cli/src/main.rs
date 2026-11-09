@@ -61,29 +61,66 @@ async fn main() -> Result<()> {
                 i += 1;
             }
 
-            if filename.is_empty() {
-                filename = url.split('/').last().unwrap_or("download").to_string();
-            }
-            filename = illusion_core::prober::sanitize_filename(&filename);
+            let (target_url, target_filename, target_headers, target_ua, target_audio_url, target_size) =
+                if illusion_core::is_video_page_url(&url) {
+                    println!("🔍 [Illusion] Detected video page URL: {}", url);
+                    println!("   Resolving media stream (360p / progressive)...");
+                    match illusion_core::resolve_media_url(&url, None).await {
+                        Ok(resolved) => {
+                            println!("   Found stream: {}", resolved.title);
+                            let resolved_filename = if filename.is_empty() || filename == "download" {
+                                resolved.filename
+                            } else {
+                                filename
+                            };
+                            (
+                                resolved.stream_url,
+                                resolved_filename,
+                                resolved.headers,
+                                resolved.user_agent,
+                                resolved.audio_url.or(audio_url),
+                                resolved.total_size,
+                            )
+                        }
+                        Err(e) => {
+                            eprintln!("⚠️  [Illusion] Stream resolution failed: {:#}", e);
+                            eprintln!("   Falling back to direct download...");
+                            let fname = if filename.is_empty() {
+                                url.split('/').last().unwrap_or("download").to_string()
+                            } else {
+                                filename
+                            };
+                            (url.clone(), fname, HashMap::new(), None, audio_url, None)
+                        }
+                    }
+                } else {
+                    let fname = if filename.is_empty() {
+                        url.split('/').last().unwrap_or("download").to_string()
+                    } else {
+                        filename
+                    };
+                    (url.clone(), fname, HashMap::new(), None, audio_url, None)
+                };
 
+            let clean_filename = illusion_core::prober::sanitize_filename(&target_filename);
             let save_dir = custom_dir.unwrap_or_else(|| state.default_download_dir.clone());
-            let save_path = save_dir.join(&filename);
+            let save_path = save_dir.join(&clean_filename);
 
             let mut task = DownloadTask::new(
-                url.clone(),
-                filename.clone(),
+                target_url.clone(),
+                clean_filename.clone(),
                 save_path.clone(),
+                target_size,
+                target_headers,
                 None,
-                HashMap::new(),
-                None,
-                Some("Illusion/0.1.0".to_string()),
+                target_ua,
             );
-            task.audio_url = audio_url;
+            task.audio_url = target_audio_url;
 
             let task_id = task.id.clone();
             state.add_task(task).await;
 
-            println!("⚡ [Illusion] Added task: {}", filename);
+            println!("⚡ [Illusion] Added task: {}", clean_filename);
             println!("   Save Path: {:?}", save_path);
             println!("   Connections: {}", conns);
             println!("   Starting download...\n");

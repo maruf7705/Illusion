@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Illusion Download Integration",
-  "version": "1.2.0",
+  "version": "1.2.3",
   "description": "High-performance IDM video/audio sniffer and multi-segment download acceleration for Arch Linux & Hyprland.",
   "browser_specific_settings": {
     "gecko": {

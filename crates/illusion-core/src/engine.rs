@@ -62,7 +62,8 @@ pub struct DownloadEngine {
 impl DownloadEngine {
     pub fn new(max_connections: usize) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(32)
             .build()
             .unwrap_or_default();
@@ -270,11 +271,13 @@ impl DownloadEngine {
                         .map(|download| download.downloaded_size)
                         .unwrap_or(0)
                 };
+                let meta = tokio::fs::metadata(&task.save_path).await.ok();
+                let actual_bytes = meta.map(|m| m.len()).unwrap_or(written_size);
                 if let Some(expected) = total_size {
-                    if written_size != expected {
+                    if actual_bytes != expected && written_size != expected {
                         let message = format!(
                             "Incomplete response: expected {} bytes, wrote {} bytes",
-                            expected, written_size
+                            expected, actual_bytes
                         );
                         {
                             let mut list = state.tasks.write().unwrap();
@@ -556,6 +559,22 @@ impl DownloadEngine {
                         }
                     }
                 }
+            }
+        }
+
+        // Final update to state after all segments finish
+        let final_downloaded = total_downloaded.load(Ordering::Relaxed);
+        let final_segs = {
+            let l = segments_mutex.lock().await;
+            l.clone()
+        };
+        {
+            let mut list = state.tasks.write().unwrap();
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.downloaded_size = final_downloaded;
+                t.segments = final_segs;
+                t.speed = 0.0;
+                t.eta_seconds = None;
             }
         }
 

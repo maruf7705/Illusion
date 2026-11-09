@@ -52,6 +52,43 @@ pub fn build_request_headers(
     headers
 }
 
+/// Reject response classes that are control/error payloads, not downloadable
+/// media.  In particular, YouTube SABR returns `application/vnd.yt-ump` from
+/// a `/videoplayback` URL; saving its small protobuf body as an MP4 caused the
+/// 31-byte failures reported by the user.
+pub fn validate_media_response(url: &str, content_type: Option<&str>) -> Result<()> {
+    let content_type = content_type.unwrap_or_default().to_ascii_lowercase();
+    if content_type.contains("application/vnd.yt-ump") {
+        return Err(anyhow::anyhow!(
+            "YouTube returned a SABR/UMP control payload, not downloadable media"
+        ));
+    }
+    if content_type.starts_with("text/html") {
+        return Err(anyhow::anyhow!("Server returned HTML instead of media"));
+    }
+
+    let is_sabr_control_url = Url::parse(url).ok().is_some_and(|parsed| {
+        let looks_like_youtube_playback = parsed.host_str().is_some_and(|host| host.contains("googlevideo.com"))
+            || parsed.path().contains("/videoplayback");
+        let mut has_sabr = false;
+        let mut has_itag = false;
+        for (name, _) in parsed.query_pairs() {
+            if name == "sabr" {
+                has_sabr = true;
+            } else if name == "itag" {
+                has_itag = true;
+            }
+        }
+        looks_like_youtube_playback && has_sabr && !has_itag
+    });
+    if is_sabr_control_url {
+        return Err(anyhow::anyhow!(
+            "YouTube returned a SABR control request without a direct media track"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteInfo {
     pub url: String,
@@ -148,6 +185,9 @@ pub async fn probe_request(
 
             if let Some(ct) = headers.get(CONTENT_TYPE) {
                 if let Ok(val) = ct.to_str() {
+                    // A response header is authoritative over a page-script
+                    // MIME hint.  This is essential when a playback endpoint
+                    // returns UMP despite a guessed video/mp4 hint.
                     content_type = Some(val.to_string());
                 }
             }
@@ -200,16 +240,16 @@ pub async fn probe_request(
                         }
                     }
                 }
-                if content_type.is_none() {
-                    if let Some(ct) = headers.get(CONTENT_TYPE) {
-                        if let Ok(val) = ct.to_str() {
-                            content_type = Some(val.to_string());
-                        }
+                if let Some(ct) = headers.get(CONTENT_TYPE) {
+                    if let Ok(val) = ct.to_str() {
+                        content_type = Some(val.to_string());
                     }
                 }
             }
         }
     }
+
+    validate_media_response(&raw_url, content_type.as_deref())?;
 
     // Resolve final filename
     let final_filename = if let Some(suggested) = suggested_filename {
@@ -281,6 +321,8 @@ pub fn sanitize_filename(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_sanitize_filename() {
@@ -312,5 +354,89 @@ mod tests {
         assert_eq!(headers.get("cookie").unwrap(), "session=abc");
         assert!(headers.get("range").is_none());
         assert!(headers.get("host").is_none());
+    }
+
+    #[test]
+    fn rejects_youtube_sabr_control_requests_without_an_itag() {
+        let error = validate_media_response(
+            "https://r1---sn.googlevideo.com/videoplayback?sabr=1&expire=123",
+            Some("application/vnd.yt-ump"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SABR/UMP"));
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_ump_even_when_the_capture_hinted_video() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 31\r\nContent-Type: application/vnd.yt-ump\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..count]).into_owned()
+        });
+
+        let context = RequestContext {
+            url: format!("http://{address}/videoplayback?itag=137"),
+            content_type: Some("video/mp4".to_string()),
+            ..RequestContext::default()
+        };
+        let error = probe_request(&reqwest::Client::new(), &context, None)
+            .await
+            .unwrap_err();
+        let request = server.await.unwrap();
+        assert!(request.starts_with("HEAD /videoplayback?itag=137 HTTP/1.1"));
+        assert!(error.to_string().contains("SABR/UMP"));
+    }
+
+    #[tokio::test]
+    async fn probe_replays_the_exact_signed_url_and_context_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let count = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..count]).into_owned();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 42\r\nAccept-Ranges: bytes\r\nContent-Type: video/mp4\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let mut headers = HashMap::new();
+        headers.insert("Referer".to_string(), "https://site.invalid/watch".to_string());
+        headers.insert("Origin".to_string(), "https://site.invalid".to_string());
+        headers.insert("Range".to_string(), "bytes=999-".to_string());
+        let context = RequestContext {
+            url: format!("http://{address}/media?sig=a%2Bb&range=1-2"),
+            headers,
+            cookies: Some("session=abc".to_string()),
+            user_agent: Some("Illusion-fixture".to_string()),
+            ..RequestContext::default()
+        };
+
+        let info = probe_request(&reqwest::Client::new(), &context, None)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("HEAD /media?sig=a%2Bb&range=1-2 HTTP/1.1"));
+        assert!(request_lower.contains("referer: https://site.invalid/watch"));
+        assert!(request_lower.contains("origin: https://site.invalid"));
+        assert!(request_lower.contains("cookie: session=abc"));
+        assert!(!request_lower.contains("range: bytes=999-"));
+        assert_eq!(info.url, context.url);
+        assert_eq!(info.total_size, Some(42));
     }
 }

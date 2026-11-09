@@ -17,6 +17,7 @@ const DEFAULT_SETTINGS = {
 
 // 1. Rolling 60-Second Ring Buffer for HTTP Headers & Session Correlation
 const headerRingBuffer = new Map();
+const responseMetadataByUrl = new Map();
 const RING_BUFFER_TTL_MS = 60 * 1000;
 
 function cleanUrlForCorrelation(url) {
@@ -68,6 +69,36 @@ function responseLength(headers) {
   return length > 0 ? length : null;
 }
 
+// YouTube's SABR transport can return a small UMP control payload from a URL
+// that looks like /videoplayback. It is not a media container. The failures
+// reported by the user have sabr=1, no itag, and a 31-byte UMP response.
+function isYouTubeSabrControlUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return (parsed.hostname.includes("googlevideo.com") || parsed.pathname.includes("/videoplayback")) &&
+      parsed.searchParams.has("sabr") &&
+      !parsed.searchParams.has("itag");
+  } catch (_) {
+    return false;
+  }
+}
+
+function isUnsupportedControlResponse(url, contentType) {
+  return (contentType || "").toLowerCase().includes("application/vnd.yt-ump") ||
+    isYouTubeSabrControlUrl(url);
+}
+
+async function removeUnsupportedControlStream(tabId, url) {
+  const streams = await getTabStreams(tabId);
+  const filtered = streams.filter((stream) => stream.url !== url);
+  if (filtered.length === streams.length) return;
+  await saveTabStreams(tabId, filtered);
+  chrome.tabs.sendMessage(tabId, {
+    type: "STREAM_REGISTRY_UPDATED",
+    streams: filtered
+  }, { frameId: 0 }).catch(() => {});
+}
+
 function candidateKind(url, mime, isProtected) {
   const lower = `${url} ${mime}`.toLowerCase();
   if (isProtected || url.startsWith("blob:")) return "protected_or_unsupported";
@@ -78,6 +109,7 @@ function candidateKind(url, mime, isProtected) {
 
 function requestContext(url, tabId, pageUrl, metadata = {}) {
   const ring = getFromRingBuffer(url) || {};
+  const observed = responseMetadataByUrl.get(url) || {};
   // `headers` are request headers captured before playback.  Response headers
   // are represented only by typed metadata below and must never be replayed.
   const headers = { ...(ring.headers || {}) };
@@ -90,9 +122,9 @@ function requestContext(url, tabId, pageUrl, metadata = {}) {
     userAgent: headers["user-agent"] || headers["User-Agent"] || ring.userAgent || navigator.userAgent,
     referer,
     origin,
-    contentType: metadata.contentType || "",
-    contentLength: metadata.contentLength || null,
-    acceptRanges: Boolean(metadata.acceptRanges)
+    contentType: metadata.contentType || observed.contentType || "",
+    contentLength: metadata.contentLength || observed.contentLength || null,
+    acceptRanges: Boolean(metadata.acceptRanges || observed.acceptRanges)
   };
 }
 
@@ -104,6 +136,7 @@ function makeCandidate(tabId, stream, pageUrl, primaryMetadata = {}) {
   const protectedReason = stream.protectedReason || null;
   return {
     id: `${tabId}:${primary.url}:${Date.now()}`,
+    pairId: audio ? `${tabId}:${primary.url}:${audio.url}` : null,
     kind: protectedReason
       ? "protected_or_unsupported"
       : audio
@@ -273,6 +306,12 @@ async function handleMediaResponse(tabId, details) {
       }
     }
   }
+  // A 206 response's Content-Length is only the requested slice.  Its
+  // Content-Range total is the only valid complete-file size.
+  if (responseHeaders["content-range"]) {
+    contentLength = responseLength(responseHeaders) || 0;
+    acceptRanges = true;
+  }
 
   const cleanUrl = url.split("?")[0].toLowerCase();
   const isYouTubePlayback = url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback");
@@ -280,6 +319,15 @@ async function handleMediaResponse(tabId, details) {
   // IDM Architecture: Retain exact RAW URL without JS query parameter alteration
   // (Prevents HMAC signature destruction on Pinterest, YouTube, Twitter)
   const targetDownloadUrl = url;
+
+  // This is the precise 31-byte `sabr.malformed_config` failure mode. Drop it
+  // before it reaches the registry, and remove a provisional page-script item
+  // in case it was emitted before response metadata arrived.
+  if (isUnsupportedControlResponse(targetDownloadUrl, contentType)) {
+    responseMetadataByUrl.delete(targetDownloadUrl);
+    await removeUnsupportedControlStream(tabId, targetDownloadUrl);
+    return;
+  }
 
   // Filter out internal chunk segments: .m4s and .ts should NOT be treated as independent top-level videos!
   const isFragment = cleanUrl.endsWith(".m4s") || cleanUrl.endsWith(".ts");
@@ -295,8 +343,7 @@ async function handleMediaResponse(tabId, details) {
     contentType.startsWith("audio/") ||
     contentType.includes("application/vnd.apple.mpegurl") ||
     contentType.includes("application/x-mpegurl") ||
-    contentType.includes("application/dash+xml") ||
-    contentType.includes("application/vnd.yt-ump");
+    contentType.includes("application/dash+xml");
 
   const isMediaExt =
     cleanUrl.endsWith(".mp4") ||
@@ -316,6 +363,18 @@ async function handleMediaResponse(tabId, details) {
   }
 
   if (isYouTubePlayback || isMediaMime || isMediaExt) {
+    responseMetadataByUrl.set(targetDownloadUrl, {
+      contentType,
+      contentLength: contentLength || null,
+      acceptRanges,
+      timestamp: Date.now()
+    });
+    if (responseMetadataByUrl.size > 200) {
+      const cutoff = Date.now() - RING_BUFFER_TTL_MS;
+      for (const [key, value] of responseMetadataByUrl.entries()) {
+        if ((value.timestamp || 0) < cutoff) responseMetadataByUrl.delete(key);
+      }
+    }
     let streams = await getTabStreams(tabId);
     if (isPlaylist) {
       // Prioritize master playlist and purge any child fragments
@@ -600,8 +659,11 @@ async function sendToIllusion(details) {
       });
       clearTimeout(timeoutId);
 
+      const jsonResp = await httpResp.json().catch(() => null);
+      if (jsonResp && jsonResp.status === "error") {
+        return { success: false, error: jsonResp.message || "Illusion rejected the download" };
+      }
       if (httpResp.ok) {
-        const jsonResp = await httpResp.json();
         console.log("[Illusion] HTTP Bridge download queued:", jsonResp);
         return { success: true, method: "http", data: jsonResp };
       }
@@ -615,6 +677,10 @@ async function sendToIllusion(details) {
         if (chrome.runtime.lastError) {
           console.warn("[Illusion] Native host error:", chrome.runtime.lastError.message);
           resolve({ success: false, error: chrome.runtime.lastError.message });
+        } else if (!response || response.status === "error") {
+          const error = (response && response.message) || "Native host rejected the download";
+          console.warn("[Illusion] Native host rejected download:", error);
+          resolve({ success: false, error });
         } else {
           console.log("[Illusion] Native host response:", response);
           resolve({ success: true, method: "native", data: response });
@@ -659,6 +725,11 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (tabId >= 0 && request.stream && request.stream.url) {
       getTabStreams(tabId).then((streams) => {
         const streamUrl = request.stream.url;
+        if (isYouTubeSabrControlUrl(streamUrl)) {
+          // Do not turn a control URL into a guessed MP4 just because a page
+          // script supplied a fallback MIME type.
+          return;
+        }
         let itag = null;
         try {
           itag = new URL(streamUrl).searchParams.get("itag");
@@ -708,6 +779,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // User clicked a download row in the Floating Bar UI
   if (request.type === "START_VIDEO_DOWNLOAD" || request.type === "MEDIA_SNIFFED_DOWNLOAD") {
     const referer = request.page_url || (sender.tab ? sender.tab.url : "");
+    if (isYouTubeSabrControlUrl(request.url || "")) {
+      sendResponse({
+        status: "error",
+        message: "YouTube exposed a SABR/UMP control request, not a downloadable media stream. Play the video until a direct media request is captured."
+      });
+      return;
+    }
     const selected = request.candidate || null;
     const candidate = selected || makeCandidate(tabId, {
       url: request.url,
@@ -721,8 +799,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       audio_url: request.audio_url || null,
       quality: request.quality || "",
       candidate
-    }).then(() => {
-      sendResponse({ status: "success" });
+    }).then((result) => {
+      if (result && result.success) {
+        sendResponse({ status: "success" });
+      } else {
+        sendResponse({
+          status: "error",
+          message: (result && result.error) || "Illusion rejected this media request"
+        });
+      }
     });
     return true;
   }

@@ -744,7 +744,12 @@
       title = `Pinterest_Video_${Date.now()}`;
     }
 
-    const ext = stream.mime && stream.mime.includes("audio") ? ".m4a" : ".mp4";
+    const mime = (stream.mime || "").toLowerCase();
+    const ext = mime.includes("webm") ? ".webm"
+      : mime.includes("audio/mpeg") ? ".mp3"
+      : mime.includes("audio/") ? ".m4a"
+      : mime.includes("quicktime") ? ".mov"
+      : ".mp4";
     const filename = title.replace(/[^a-zA-Z0-9_\-\. ]/g, "_").trim() + ext;
 
     // Only an explicit capture correlation is allowed to pair audio.  The
@@ -766,6 +771,7 @@
     };
 
     let dispatched = false;
+    let dispatchError = "";
 
     // 1. Primary Channel: Extension Background Service (enriches with Cookies & Header Ring Buffer)
     if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
@@ -781,22 +787,30 @@
             candidate: stream.candidate || null
           }, (response) => {
             if (chrome.runtime.lastError || (response && response.status === "error")) {
-              resolve(false);
+              resolve({
+                ok: false,
+                error: (response && response.message) ||
+                  (chrome.runtime.lastError && chrome.runtime.lastError.message) ||
+                  "Illusion rejected this media request"
+              });
             } else {
-              resolve(true);
+              resolve({ ok: true });
             }
           });
         });
-        if (res) {
+        if (res.ok) {
           dispatched = true;
+        } else {
+          dispatchError = res.error || "Illusion rejected this media request";
         }
       } catch (e) {
         console.warn("[Illusion] Extension runtime message failed:", e);
       }
     }
 
-    // 2. Secondary Channel: Direct HTTP Bridge Fallback (only if runtime disconnected)
-    if (!dispatched) {
+    // 2. Secondary Channel: Direct HTTP Bridge Fallback only if the extension
+    // runtime was unavailable. Do not bypass a deliberate media rejection.
+    if (!dispatched && !dispatchError) {
       try {
         const resp = await fetch("http://127.0.0.1:9095/add_download", {
           method: "POST",
@@ -812,7 +826,7 @@
     if (dispatched) {
       showFeedback("✓ Queued to Illusion!", false);
     } else {
-      showFeedback("✕ Connection Failed — Launch Illusion", true);
+      showFeedback(dispatchError ? `✕ ${dispatchError}` : "✕ Connection Failed — Launch Illusion", true);
     }
   }
 

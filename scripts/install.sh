@@ -11,11 +11,11 @@ echo "⚡ [Illusion] Installing Illusion IDM for Arch Linux & Hyprland..."
 # Ensure target directories exist
 mkdir -p "$BIN_DIR" "$DESKTOP_DIR" "$ICON_DIR"
 
-# 1. Build release binaries if not present
-if [ ! -f "$SCRIPT_DIR/target/release/illusion" ]; then
-    echo "📦 Building release binaries with Cargo..."
-    cd "$SCRIPT_DIR" && cargo build --release
-fi
+# 1. Always build the current release.  Checking only whether a previous
+# binary exists can reinstall stale code after the source changed.
+echo "📦 Building current release binaries with Cargo..."
+cd "$SCRIPT_DIR" && cargo build --release --workspace
+"$SCRIPT_DIR/scripts/sync-firefox-extension.sh"
 
 # 2. Copy binaries to ~/.local/bin
 echo "🚀 Installing binaries to $BIN_DIR..."

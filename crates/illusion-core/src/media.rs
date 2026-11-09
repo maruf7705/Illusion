@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +62,10 @@ impl RequestContext {
 pub struct MediaCandidate {
     #[serde(default)]
     pub id: Option<String>,
+    /// Stable identifier proving that the primary and audio contexts were
+    /// captured as one explicit selection, never inferred from tab history.
+    #[serde(default)]
+    pub pair_id: Option<String>,
     #[serde(default)]
     pub kind: MediaCandidateKind,
     #[serde(default)]
@@ -80,6 +85,7 @@ impl MediaCandidate {
     pub fn progressive(url: String, headers: HashMap<String, String>) -> Self {
         Self {
             id: None,
+            pair_id: None,
             kind: MediaCandidateKind::Progressive,
             page_url: None,
             primary: RequestContext {
@@ -107,6 +113,29 @@ impl MediaCandidate {
             (None, None) => None,
         }
     }
+
+    /// Chooses a container from observed MIME information for paired tracks.
+    /// MKV is the safe stream-copy container for mixed MP4/WebM codecs.
+    pub fn output_filename(&self, filename: String) -> String {
+        if self.kind != MediaCandidateKind::PairedAudioVideo {
+            return filename;
+        }
+        let primary = self.primary.content_type.as_deref().unwrap_or_default();
+        let audio = self
+            .audio
+            .as_ref()
+            .and_then(|context| context.content_type.as_deref())
+            .unwrap_or_default();
+        let extension = match (primary.contains("webm"), audio.contains("webm")) {
+            (true, true) => "webm",
+            (true, false) | (false, true) => "mkv",
+            (false, false) => "mp4",
+        };
+        Path::new(&filename)
+            .with_extension(extension)
+            .to_string_lossy()
+            .into_owned()
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +161,7 @@ mod tests {
     fn paired_size_is_unknown_when_one_track_has_no_observed_size() {
         let candidate = MediaCandidate {
             id: None,
+            pair_id: Some("fixture-pair".to_string()),
             kind: MediaCandidateKind::PairedAudioVideo,
             page_url: None,
             primary: RequestContext {
@@ -150,5 +180,27 @@ mod tests {
         };
 
         assert_eq!(candidate.expected_size(), None);
+    }
+
+    #[test]
+    fn mixed_webm_and_mp4_tracks_use_mkv() {
+        let candidate = MediaCandidate {
+            id: None,
+            pair_id: Some("fixture-pair".to_string()),
+            kind: MediaCandidateKind::PairedAudioVideo,
+            page_url: None,
+            primary: RequestContext {
+                content_type: Some("video/webm".to_string()),
+                ..RequestContext::default()
+            },
+            audio: Some(RequestContext {
+                content_type: Some("audio/mp4".to_string()),
+                ..RequestContext::default()
+            }),
+            quality: None,
+            codecs: None,
+            unsupported_reason: None,
+        };
+        assert_eq!(candidate.output_filename("movie.mp4".to_string()), "movie.mkv");
     }
 }

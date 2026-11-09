@@ -59,6 +59,9 @@ pub fn build_download_task(
         }
         MediaCandidate {
             id: None,
+            pair_id: request_audio_url
+                .as_ref()
+                .map(|audio| format!("legacy:{}:{}", request_url, audio)),
             kind: if request_audio_url.is_some() {
                 MediaCandidateKind::PairedAudioVideo
             } else {
@@ -90,10 +93,26 @@ pub fn build_download_task(
     if candidate.primary.url.trim().is_empty() {
         return Err("Missing URL in download request".to_string());
     }
+    for context in std::iter::once(&candidate.primary).chain(candidate.audio.iter()) {
+        illusion_core::prober::validate_media_response(
+            &context.url,
+            context.content_type.as_deref(),
+        )
+        .map_err(|error| error.to_string())?;
+    }
     if candidate.kind == MediaCandidateKind::ProtectedOrUnsupported {
         return Err(candidate
             .unsupported_reason
             .unwrap_or_else(|| "This protected media stream cannot be downloaded".to_string()));
+    }
+    if candidate.kind == MediaCandidateKind::PairedAudioVideo
+        && (candidate.audio.is_none()
+            || candidate
+                .pair_id
+                .as_ref()
+                .map_or(true, |pair_id| pair_id.trim().is_empty()))
+    {
+        return Err("Paired media requires both an audio request and an explicit pair ID".to_string());
     }
 
     let mut legacy_headers = request_headers;
@@ -129,6 +148,7 @@ pub fn build_download_task(
             .unwrap_or("download")
             .to_string();
     }
+    filename = candidate.output_filename(filename);
     filename = illusion_core::prober::sanitize_filename(&filename);
     let save_path = download_dir.join(&filename);
     Ok(DownloadTask::from_media_candidate(candidate, filename, save_path))
