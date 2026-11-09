@@ -21,19 +21,13 @@
     if (!url || typeof url !== "string") return "";
     try {
       const u = new URL(url);
-      u.searchParams.delete("bytestart");
-      u.searchParams.delete("byteend");
-      u.searchParams.delete("range");
-      u.searchParams.delete("rn");
-      u.searchParams.delete("alr");
-      u.searchParams.delete("sq");
-      u.searchParams.delete("segment");
-      u.searchParams.delete("frag");
-      u.searchParams.delete("sabr");
-      u.searchParams.delete("rqh");
-      u.searchParams.delete("ump");
-      u.searchParams.delete("len");
-      u.searchParams.delete("begin");
+      const sparams = (u.searchParams.get("sparams") || "").split(",");
+      // CRITICAL: Never strip parameters that are signed by Google Video sparams HMAC!
+      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag", "sabr", "rqh", "ump", "len", "begin"].forEach((p) => {
+        if (!sparams.includes(p)) {
+          u.searchParams.delete(p);
+        }
+      });
       return u.toString();
     } catch (_) {
       return url;
@@ -58,6 +52,14 @@
       stream.itag = itag.toString();
     }
 
+    if (!stream.size || stream.size === 0) {
+      try {
+        const u = new URL(url);
+        const clen = u.searchParams.get("clen") || u.searchParams.get("filesize") || u.searchParams.get("size");
+        if (clen) stream.size = parseInt(clen, 10) || 0;
+      } catch (_) {}
+    }
+
     const idx = currentStreams.findIndex((s) => {
       if (s.url === url) return true;
       if (itag && s.itag && s.itag.toString() === itag.toString()) {
@@ -78,6 +80,15 @@
       };
     } else {
       currentStreams.push(stream);
+    }
+
+    // Propagate audioUrl to any video stream that lacks an audio pairing
+    if (stream.audioUrl) {
+      currentStreams.forEach((s) => {
+        if (!s.audioUrl && !(s.mime || "").includes("audio")) {
+          s.audioUrl = stream.audioUrl;
+        }
+      });
     }
 
     window.__ILLUSION_DISCOVERED_STREAMS__ = currentStreams;
@@ -137,12 +148,24 @@
         const formats = streaming.formats || [];
         const adaptive = streaming.adaptiveFormats || [];
 
+        // Check if pure HLS master manifest is present (non-SABR master playlist)
+        if (streaming.hlsManifestUrl) {
+          addStream({
+            url: streaming.hlsManifestUrl,
+            quality: "HLS Master Playlist (All Qualities)",
+            mime: "application/vnd.apple.mpegurl",
+            size: 0,
+            audioUrl: null
+          });
+        }
+
         let bestAudio = null;
         for (const f of adaptive) {
           if (f.mimeType && f.mimeType.includes("audio")) {
             let aUrl = f.url;
-            if (!aUrl && (f.signatureCipher || f.cipher)) {
-              try { aUrl = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+            if (!aUrl && f.itag) {
+              const existingAudio = currentStreams.find((s) => s.itag === f.itag.toString() && s.url && !s.url.startsWith("blob:"));
+              if (existingAudio) aUrl = existingAudio.url;
             }
             if (aUrl) {
               bestAudio = cleanMediaUrl(aUrl);
@@ -153,8 +176,9 @@
 
         formats.forEach((f) => {
           let u = f.url;
-          if (!u && (f.signatureCipher || f.cipher)) {
-            try { u = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+          if (!u && f.itag) {
+            const existingStream = currentStreams.find((s) => s.itag === f.itag.toString() && s.url && !s.url.startsWith("blob:"));
+            if (existingStream) u = existingStream.url;
           }
           if (u) {
             addStream({
@@ -171,8 +195,9 @@
         adaptive.forEach((f) => {
           const isAudio = f.mimeType && f.mimeType.includes("audio");
           let u = f.url;
-          if (!u && (f.signatureCipher || f.cipher)) {
-            try { u = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+          if (!u && f.itag) {
+            const existingStream = currentStreams.find((s) => s.itag === f.itag.toString() && s.url && !s.url.startsWith("blob:"));
+            if (existingStream) u = existingStream.url;
           }
           if (u) {
             const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
@@ -730,15 +755,31 @@
 
   async function triggerDownload(stream) {
     if (!stream || !stream.url) return;
-    const title = (document.title || "video").replace(" - YouTube", "").trim();
+    let title = (document.title || "video").replace(" - YouTube", "").trim();
+    if (window.location.hostname.includes("twitter.com") || window.location.hostname.includes("x.com")) {
+      const tweetEl = document.querySelector("article[data-testid='tweet']");
+      const tweetText = tweetEl ? tweetEl.innerText.split("\n")[0].substring(0, 45) : "";
+      if (tweetText && tweetText.length > 3) {
+        title = tweetText;
+      } else {
+        title = `Twitter_Video_${Date.now()}`;
+      }
+    } else if (window.location.hostname.includes("facebook.com")) {
+      title = `Facebook_Video_${Date.now()}`;
+    } else if (window.location.hostname.includes("instagram.com")) {
+      title = `Instagram_Video_${Date.now()}`;
+    } else if (window.location.hostname.includes("pinterest.com")) {
+      title = `Pinterest_Video_${Date.now()}`;
+    }
+
     const ext = stream.mime && stream.mime.includes("audio") ? ".m4a" : ".mp4";
     const filename = title.replace(/[^a-zA-Z0-9_\-\. ]/g, "_").trim() + ext;
 
-    // Guarantee audio track pairing for YouTube adaptive streams (IDM parity)
+    // Guarantee audio track pairing for separated adaptive streams (YouTube, Facebook, Vimeo, etc.)
     let effectiveAudioUrl = stream.audioUrl || null;
     const isVideo = !stream.mime || !stream.mime.includes("audio");
-    if (!effectiveAudioUrl && isVideo && (stream.url.includes("googlevideo.com") || window.location.hostname.includes("youtube.com"))) {
-      const audioMatch = currentStreams.find(s => (s.mime && s.mime.includes("audio")) || ["140", "251", "250", "249"].includes(s.itag));
+    if (!effectiveAudioUrl && isVideo) {
+      const audioMatch = currentStreams.find(s => (s.mime && s.mime.includes("audio")) || (s.quality && s.quality.toLowerCase().includes("audio")) || ["140", "251", "250", "249"].includes(s.itag));
       if (audioMatch && audioMatch.url && audioMatch.url !== stream.url) {
         effectiveAudioUrl = audioMatch.url;
       }
@@ -749,6 +790,13 @@
       url: stream.url,
       filename: filename,
       referer: window.location.href,
+      audio_url: effectiveAudioUrl,
+      quality: stream.quality || "",
+      headers: {
+        Referer: window.location.href,
+        "User-Agent": navigator.userAgent
+      }
+    };
       audio_url: effectiveAudioUrl,
       quality: stream.quality || "",
       headers: {

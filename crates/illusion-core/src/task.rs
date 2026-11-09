@@ -1,4 +1,5 @@
 use crate::segment::Segment;
+use crate::media::{MediaCandidate, MediaCandidateKind, RequestContext};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -119,6 +120,10 @@ pub struct DownloadTask {
     pub audio_url: Option<String>,
     #[serde(default)]
     pub quality: Option<String>,
+    /// The browser-captured request set. Older tasks omit this and continue to
+    /// use the legacy URL fields.
+    #[serde(default)]
+    pub media_candidate: Option<MediaCandidate>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }
@@ -152,9 +157,67 @@ impl DownloadTask {
             user_agent,
             audio_url: None,
             quality: None,
+            media_candidate: None,
             created_at: Utc::now(),
             completed_at: None,
         }
+    }
+
+    pub fn from_media_candidate(
+        candidate: MediaCandidate,
+        filename: String,
+        save_path: PathBuf,
+    ) -> Self {
+        let mut task = Self::new(
+            candidate.primary.url.clone(),
+            filename,
+            save_path,
+            candidate.expected_size(),
+            candidate.primary.normalized_headers(),
+            candidate.primary.cookies.clone(),
+            candidate.primary.user_agent.clone(),
+        );
+        task.audio_url = candidate.audio.as_ref().map(|audio| audio.url.clone());
+        task.quality = candidate.quality.clone();
+        task.media_candidate = Some(candidate);
+        task
+    }
+
+    pub fn primary_request(&self) -> RequestContext {
+        self.media_candidate
+            .as_ref()
+            .map(|candidate| candidate.primary.clone())
+            .unwrap_or_else(|| RequestContext {
+                url: self.url.clone(),
+                headers: self.headers.clone(),
+                cookies: self.cookies.clone(),
+                user_agent: self.user_agent.clone(),
+                referer: self.headers.get("referer").cloned().or_else(|| self.headers.get("Referer").cloned()),
+                ..RequestContext::default()
+            })
+    }
+
+    pub fn audio_request(&self) -> Option<RequestContext> {
+        self.media_candidate
+            .as_ref()
+            .and_then(|candidate| candidate.audio.clone())
+            .or_else(|| {
+                self.audio_url.as_ref().map(|url| RequestContext {
+                    url: url.clone(),
+                    headers: self.headers.clone(),
+                    cookies: self.cookies.clone(),
+                    user_agent: self.user_agent.clone(),
+                    referer: self.headers.get("referer").cloned().or_else(|| self.headers.get("Referer").cloned()),
+                    ..RequestContext::default()
+                })
+            })
+    }
+
+    pub fn candidate_kind(&self) -> MediaCandidateKind {
+        self.media_candidate
+            .as_ref()
+            .map(|candidate| candidate.kind)
+            .unwrap_or_else(|| if self.audio_url.is_some() { MediaCandidateKind::PairedAudioVideo } else { MediaCandidateKind::Progressive })
     }
 
     pub fn progress_percent(&self) -> f32 {

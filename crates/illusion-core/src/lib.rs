@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod media;
 pub mod muxer;
 pub mod prober;
 pub mod scheduler;
@@ -9,6 +10,7 @@ pub mod stream_engine;
 pub mod task;
 
 pub use engine::{DownloadEngine, RateLimiter};
+pub use media::{MediaCandidate, MediaCandidateKind, RequestContext};
 pub use prober::{probe_url, RemoteInfo};
 pub use scheduler::{ActiveSegment, DynamicScheduler, MIN_SPLIT_SIZE};
 pub use segment::{Segment, SegmentStatus};

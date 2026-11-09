@@ -121,7 +121,17 @@ impl DownloadEngine {
                 )
                 .await)
             }
-            crate::stream_engine::StreamDispatchMode::HlsDashSegmented => {
+            crate::stream_engine::StreamDispatchMode::DashSegmented => {
+                Some(crate::stream_engine::StreamEngine::download_dash(
+                    &self.client,
+                    &task_id,
+                    &task,
+                    state.clone(),
+                    &mut cancel_rx,
+                )
+                .await)
+            }
+            crate::stream_engine::StreamDispatchMode::HlsSegmented => {
                 Some(crate::stream_engine::StreamEngine::download_hls(
                     &self.client,
                     &task_id,
@@ -561,12 +571,13 @@ impl DownloadEngine {
         state: AppState,
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<()> {
-        let is_googlevideo = url.contains("googlevideo.com") || url.contains("videoplayback");
+        let clean_url = crate::stream_engine::clean_stream_url(url);
+        let is_googlevideo = clean_url.contains("googlevideo.com") || clean_url.contains("videoplayback");
         let mut headers = HeaderMap::new();
         for (k, v) in headers_map {
             let k_lower = k.to_lowercase();
             if k_lower == "host" || k_lower == "content-length" || k_lower == "origin" 
-               || k_lower.starts_with("sec-fetch-") {
+               || k_lower.starts_with("sec-fetch-") || k_lower.starts_with("sec-ch-") {
                 continue;
             }
             if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
@@ -577,6 +588,12 @@ impl DownloadEngine {
             if let Ok(val) = HeaderValue::from_str(ua) {
                 headers.insert(USER_AGENT, val);
             }
+        }
+        if !headers.contains_key(USER_AGENT) {
+            headers.insert(
+                USER_AGENT,
+                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+            );
         }
         if let Some(c) = cookies {
             if let Ok(val) = HeaderValue::from_str(c) {
@@ -596,12 +613,12 @@ impl DownloadEngine {
             headers.insert(reqwest::header::RANGE, HeaderValue::from_static("bytes=0-"));
         }
 
-        let mut resp = self.client.get(url).headers(headers.clone()).send().await?;
+        let mut resp = self.client.get(&clean_url).headers(headers.clone()).send().await?;
         let mut status = resp.status();
         if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
             // Google Video CDN node fallback
             if status == reqwest::StatusCode::FORBIDDEN && is_googlevideo {
-                if let Ok(u) = url::Url::parse(url) {
+                if let Ok(u) = url::Url::parse(&clean_url) {
                     let mn = u.query_pairs().find(|(k, _)| k == "mn").map(|(_, v)| v.to_string());
                     if let Some(mn_val) = mn {
                         let servers: Vec<&str> = mn_val.split(',').collect();
@@ -609,7 +626,7 @@ impl DownloadEngine {
                             let new_host = format!("{}.googlevideo.com", srv);
                             if let Some(curr_h) = u.host_str() {
                                 if !curr_h.contains(srv) {
-                                    let fb_url = url.replace(curr_h, &new_host);
+                                    let fb_url = clean_url.replace(curr_h, &new_host);
                                     if let Ok(fb_resp) = self.client.get(&fb_url).headers(headers.clone()).send().await {
                                         if fb_resp.status().is_success() || fb_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
                                             resp = fb_resp;
@@ -701,13 +718,15 @@ async fn run_segment_worker(
         }
     };
 
+    let clean_url = crate::stream_engine::clean_stream_url(&url);
+
     while current <= end && !stop.load(Ordering::Relaxed) {
         let mut req_headers = HeaderMap::new();
 
         for (k, v) in &headers_map {
             let k_lower = k.to_lowercase();
             if k_lower == "range" || k_lower == "host" || k_lower == "content-length" 
-               || k_lower == "origin" || k_lower.starts_with("sec-fetch-") {
+               || k_lower == "origin" || k_lower.starts_with("sec-fetch-") || k_lower.starts_with("sec-ch-") {
                 continue;
             }
             if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
@@ -718,7 +737,7 @@ async fn run_segment_worker(
         let range_str = format!("bytes={}-{}", current, end);
         req_headers.insert(RANGE, HeaderValue::from_str(&range_str)?);
 
-        if url.contains("googlevideo.com") && !req_headers.contains_key(reqwest::header::REFERER) {
+        if clean_url.contains("googlevideo.com") && !req_headers.contains_key(reqwest::header::REFERER) {
             req_headers.insert(
                 reqwest::header::REFERER,
                 HeaderValue::from_static("https://www.youtube.com/"),
@@ -728,6 +747,12 @@ async fn run_segment_worker(
             if let Ok(val) = HeaderValue::from_str(ua) {
                 req_headers.insert(USER_AGENT, val);
             }
+        }
+        if !req_headers.contains_key(USER_AGENT) {
+            req_headers.insert(
+                USER_AGENT,
+                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+            );
         }
         if let Some(ref c) = cookies {
             if let Ok(val) = HeaderValue::from_str(c) {
@@ -744,7 +769,7 @@ async fn run_segment_worker(
                 return Ok(());
             }
 
-            match client.get(&url).headers(req_headers.clone()).send().await {
+            match client.get(&clean_url).headers(req_headers.clone()).send().await {
                 Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT || (current == 0 && r.status() == reqwest::StatusCode::OK) => break r,
                 Ok(r) if r.status() == reqwest::StatusCode::OK && current > 0 => {
                     // Server does not support byte-range slicing (returned 200 OK for sub-range)

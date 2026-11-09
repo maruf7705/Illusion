@@ -206,6 +206,27 @@
 
   function inspectStreamingData(streaming, activeUrl) {
     if (!streaming) return;
+
+    // 0. Process HLS and DASH master manifests if available
+    if (streaming.hlsManifestUrl) {
+      emitMediaDiscovery({
+        url: cleanUrl(streaming.hlsManifestUrl),
+        quality: "HLS Master Stream (.m3u8)",
+        mime: "application/vnd.apple.mpegurl",
+        size: 0,
+        audioUrl: null
+      });
+    }
+    if (streaming.dashManifestUrl) {
+      emitMediaDiscovery({
+        url: cleanUrl(streaming.dashManifestUrl),
+        quality: "MPEG-DASH Stream (.mpd)",
+        mime: "application/dash+xml",
+        size: 0,
+        audioUrl: null
+      });
+    }
+
     const formats = streaming.formats || [];
     const adaptive = streaming.adaptiveFormats || [];
 
@@ -284,7 +305,7 @@
         } else if (url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback")) {
           trackPlaybackUrl(url);
           inspectGlobalPlayerState(url);
-        } else if (url.match(/\.(mp4|webm|m3u8|mpd|m4s|mp3|m4a|wav|ts)(\?|$)/i)) {
+        } else if (url.match(/\.(mp4|webm|m3u8|mpd|mp3|m4a|wav)(\?|$)/i)) {
           emitMediaDiscovery({ url });
         }
       }
@@ -301,7 +322,7 @@
         if (url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback")) {
           trackPlaybackUrl(url);
           inspectGlobalPlayerState(url);
-        } else if (url.match(/\.(mp4|webm|m3u8|mpd|m4s|mp3|m4a|wav|ts)(\?|$)/i)) {
+        } else if (url.match(/\.(mp4|webm|m3u8|mpd|mp3|m4a|wav)(\?|$)/i)) {
           emitMediaDiscovery({ url });
         }
       }
@@ -375,12 +396,27 @@
                 const props = fiber.memoizedProps;
                 if (props) {
                   const meta = props.coreVideoPlayerMetaData || props.videoFBID || props.videoData;
+
+                  // 1. Check for progressive muxed MP4 (contains audio + video natively!)
+                  const progressiveUrl = props.progressive_download_url || (meta && meta.progressive_download_url) || props.browser_native_hd_url || props.browser_native_sd_url || (meta && (meta.browser_native_hd_url || meta.browser_native_sd_url));
+                  if (progressiveUrl && typeof progressiveUrl === "string" && progressiveUrl.startsWith("http")) {
+                    emitMediaDiscovery({
+                      url: progressiveUrl,
+                      quality: "HD 1080p (Progressive MP4)",
+                      mime: "video/mp4",
+                      audioUrl: null
+                    });
+                  }
+
+                  // 2. Check for separate video and audio playback URLs or DASH manifest
+                  const audioSrc = props.audioPlaybackUrl || props.audio_src || (meta && (meta.audioPlaybackUrl || meta.audio_src));
                   const src = props.playbackUrl || props.hd_src || props.sd_src || (meta && (meta.playbackUrl || meta.hd_src || meta.sd_src));
                   if (src && typeof src === "string" && src.startsWith("http")) {
                     emitMediaDiscovery({
                       url: src,
                       quality: (props.hd_src || (meta && meta.hd_src)) ? "HD 1080p" : "SD 720p",
-                      mime: src.includes(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4"
+                      mime: src.includes(".mpd") ? "application/dash+xml" : (src.includes(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4"),
+                      audioUrl: (audioSrc && typeof audioSrc === "string" && audioSrc.startsWith("http")) ? audioSrc : null
                     });
                   }
                 }

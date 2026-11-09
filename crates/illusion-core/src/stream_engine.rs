@@ -1,24 +1,29 @@
 // Illusion Multi-Engine Stream Dispatcher
-// IDM-Grade Stream Handlers: Dual-Stream Adaptive Video+Audio Muxing, HLS (.m3u8), and Direct Byte-Range
+// IDM-Grade Stream Handlers: Dual-Stream Adaptive Video+Audio Muxing, HLS (.m3u8), MPEG-DASH (.mpd), and Direct Byte-Range
 // Zero yt-dlp / Zero Python / Pure Native Concurrency
 
 use crate::state::AppState;
 use crate::task::{DownloadTask, TaskStatus};
 use anyhow::{anyhow, Result};
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, RANGE};
 use std::path::PathBuf;
 use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{info, warn};
+use url::Url;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamDispatchMode {
     /// Mode A: Standard HTTP 206 Partial Content with fallocate + pwrite + dynamic halving
     DirectByteRange,
-    /// Mode B: HLS (.m3u8) or DASH (.mpd) segmented manifest streams
-    HlsDashSegmented,
+    /// Mode B1: HLS (.m3u8) segmented manifest streams
+    HlsSegmented,
+    /// Mode B2: MPEG-DASH (.mpd) segmented manifest streams
+    DashSegmented,
     /// Mode C: Separated Video + Audio adaptive streams (YouTube 1080p+, Facebook DASH, Vimeo adaptive)
     SeparatedVideoAudioMux,
 }
@@ -87,21 +92,170 @@ pub fn clean_stream_url(raw_url: &str) -> String {
     raw_url.to_string()
 }
 
+/// Resolves a relative URL against a base URL, preserving query parameters (e.g. auth tokens, signatures)
+/// from the base URL if the relative reference doesn't define its own query string.
+pub fn resolve_url_preserving_query(base: &Url, rel: &str) -> String {
+    let trimmed = rel.trim();
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.to_string();
+    }
+    if let Ok(mut resolved) = base.join(trimmed) {
+        if resolved.query().is_none() && base.query().is_some() {
+            resolved.set_query(base.query());
+        }
+        resolved.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Parses an ISO 8601 duration string (e.g. "PT1H2M30.5S" or "PT90S") into seconds.
+pub fn parse_iso8601_duration(d: &str) -> Option<f64> {
+    let trimmed = d.trim();
+    if !trimmed.starts_with('P') {
+        return None;
+    }
+    let s = trimmed.trim_start_matches('P').trim_start_matches('T');
+    let mut total = 0.0;
+    let mut num_str = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num_str.push(ch);
+        } else {
+            let val = num_str.parse::<f64>().unwrap_or(0.0);
+            num_str.clear();
+            match ch {
+                'H' => total += val * 3600.0,
+                'M' => total += val * 60.0,
+                'S' => total += val,
+                'D' => total += val * 86400.0,
+                _ => {}
+            }
+        }
+    }
+    Some(total)
+}
+
+/// Formats an MPEG-DASH template identifier string according to ISO/IEC 23009-1.
+pub fn format_dash_template(
+    template: &str,
+    rep_id: &str,
+    number: Option<u64>,
+    time: Option<u64>,
+    bandwidth: Option<u64>,
+) -> String {
+    let mut result = template.replace("$$", "\x01");
+    result = result.replace("$RepresentationID$", rep_id);
+
+    if let Some(bw) = bandwidth {
+        result = result.replace("$Bandwidth$", &bw.to_string());
+    }
+
+    if let Some(num) = number {
+        while let Some(start) = result.find("$Number%") {
+            if let Some(rel_end) = result[start + 1..].find('$') {
+                let end = start + 1 + rel_end;
+                let spec = result[start..=end].to_string();
+                let inner = spec.trim_start_matches("$Number%").trim_end_matches("d$").trim_end_matches('$');
+                let inner = inner.trim_start_matches('0');
+                let width = inner.parse::<usize>().unwrap_or(1);
+                let formatted = format!("{:0width$}", num, width = width);
+                result = result.replace(&spec, &formatted);
+            } else {
+                break;
+            }
+        }
+        result = result.replace("$Number$", &num.to_string());
+    }
+
+    if let Some(t) = time {
+        while let Some(start) = result.find("$Time%") {
+            if let Some(rel_end) = result[start + 1..].find('$') {
+                let end = start + 1 + rel_end;
+                let spec = result[start..=end].to_string();
+                let inner = spec.trim_start_matches("$Time%").trim_end_matches("d$").trim_end_matches('$');
+                let inner = inner.trim_start_matches('0');
+                let width = inner.parse::<usize>().unwrap_or(1);
+                let formatted = format!("{:0width$}", t, width = width);
+                result = result.replace(&spec, &formatted);
+            } else {
+                break;
+            }
+        }
+        result = result.replace("$Time$", &t.to_string());
+    }
+
+    result.replace("\x01", "$")
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaChunk {
+    pub url: String,
+    pub range: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DashSegmentTemplateData {
+    initialization: Option<String>,
+    media: Option<String>,
+    timescale: u64,
+    start_number: u64,
+    duration: u64,
+    timeline: Vec<(Option<u64>, u64, Option<u64>)>, // (t, d, r)
+}
+
+#[derive(Debug, Clone)]
+struct DashRepresentationData {
+    id: String,
+    bandwidth: u64,
+    segment_template: Option<DashSegmentTemplateData>,
+    initialization_url: Option<String>,
+    initialization_range: Option<(u64, u64)>,
+    segment_urls: Vec<MediaChunk>,
+    base_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DashAdaptationSetData {
+    is_video: bool,
+    is_audio: bool,
+    segment_template: Option<DashSegmentTemplateData>,
+    representations: Vec<DashRepresentationData>,
+}
+
 impl StreamEngine {
     pub fn classify_task(task: &DownloadTask) -> StreamDispatchMode {
         let url_lower = task.url.to_lowercase();
+        let audio_url_lower = task.audio_url.as_ref().map(|s| s.to_lowercase());
 
-        // 1. Separated adaptive video + audio (takes highest precedence)
+        // 1. MPEG-DASH (.mpd) manifests (manifest inspection takes precedence over dual-stream)
+        if url_lower.contains(".mpd")
+            || task
+                .headers
+                .get("content-type")
+                .map_or(false, |ct| ct.contains("dash+xml"))
+            || audio_url_lower.as_ref().map_or(false, |s| s.contains(".mpd"))
+        {
+            return StreamDispatchMode::DashSegmented;
+        }
+
+        // 2. HLS (.m3u8) playlists (manifest inspection takes precedence over dual-stream)
+        if url_lower.contains(".m3u8")
+            || task
+                .headers
+                .get("content-type")
+                .map_or(false, |ct| ct.contains("mpegurl"))
+            || audio_url_lower.as_ref().map_or(false, |s| s.contains(".m3u8"))
+        {
+            return StreamDispatchMode::HlsSegmented;
+        }
+
+        // 3. Separated adaptive video + audio (takes precedence over direct byte-range)
         if task.audio_url.is_some() {
             return StreamDispatchMode::SeparatedVideoAudioMux;
         }
 
-        // 2. HLS / DASH playlists
-        if url_lower.contains(".m3u8") || url_lower.contains(".mpd") {
-            return StreamDispatchMode::HlsDashSegmented;
-        }
-
-        // 3. Direct byte-range download (Standard IDM multi-segment chunk halving)
+        // 4. Direct byte-range download (Standard IDM multi-segment chunk halving)
         StreamDispatchMode::DirectByteRange
     }
 
@@ -125,8 +279,22 @@ impl StreamEngine {
             task.filename
         );
 
-        if let Some(parent) = task.save_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
+        // Pre-parse clen (content length) from query parameters upfront so file size is known before download
+        let v_clen = Url::parse(&task.url).ok().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize"))
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        });
+        let a_clen = Url::parse(audio_url).ok().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize"))
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        });
+        if let (Some(v), Some(a)) = (v_clen, a_clen) {
+            let mut list = state.tasks.write().unwrap();
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.total_size = Some(v + a);
+            }
         }
 
         let video_part = task.save_path.with_extension("video_part.mp4");
@@ -143,12 +311,6 @@ impl StreamEngine {
             if let Ok(val) = HeaderValue::from_str(ua) {
                 headers.insert(reqwest::header::USER_AGENT, val);
             }
-        }
-        if !headers.contains_key(reqwest::header::USER_AGENT) {
-            headers.insert(
-                reqwest::header::USER_AGENT,
-                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
-            );
         }
         let referer = task.headers.get("referer").or_else(|| task.headers.get("Referer"));
         if let Some(ref_url) = referer {
@@ -173,13 +335,6 @@ impl StreamEngine {
         headers.remove("sec-fetch-mode");
         headers.remove("sec-fetch-site");
         headers.remove("sec-fetch-dest");
-        if let Some(ref cookies) = task.cookies {
-            if !cookies.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(cookies) {
-                    headers.insert(reqwest::header::COOKIE, val);
-                }
-            }
-        }
 
         let (progress_tx, mut progress_rx) =
             tokio::sync::mpsc::channel::<(bool, u64, Option<u64>)>(256);
@@ -208,8 +363,8 @@ impl StreamEngine {
 
         drop(progress_tx); // Close original sender so loop terminates when both workers finish
 
-        let mut video_total: Option<u64> = None;
-        let mut audio_total: Option<u64> = None;
+        let mut video_total: Option<u64> = v_clen;
+        let mut audio_total: Option<u64> = a_clen;
         let mut total_downloaded: u64 = 0;
         let mut last_instant = Instant::now();
         let mut last_bytes: u64 = 0;
@@ -310,7 +465,7 @@ impl StreamEngine {
         Ok(())
     }
 
-    /// Mode B: HLS (.m3u8) IDM-Grade Segmented Downloader with fMP4 (#EXT-X-MAP) & Master Variant selection
+    /// Mode B1: HLS (.m3u8) IDM-Grade Segmented Downloader with fMP4 (#EXT-X-MAP), Byterange support, and Master Variant selection
     pub async fn download_hls(
         client: &reqwest::Client,
         task_id: &str,
@@ -361,7 +516,7 @@ impl StreamEngine {
         // 1. Fetch playlist content
         let resp = client.get(&task.url).headers(headers.clone()).send().await?;
         let playlist_text = resp.text().await?;
-        let base_url = url::Url::parse(&task.url)?;
+        let base_url = Url::parse(&task.url)?;
 
         struct HlsVariant {
             bandwidth: u64,
@@ -407,11 +562,7 @@ impl StreamEngine {
                 }
                 if j < lines.len() {
                     let uri = lines[j];
-                    let resolved = if uri.starts_with("http://") || uri.starts_with("https://") {
-                        uri.to_string()
-                    } else {
-                        base_url.join(uri)?.to_string()
-                    };
+                    let resolved = resolve_url_preserving_query(&base_url, uri);
                     variants.push(HlsVariant {
                         bandwidth,
                         uri: resolved,
@@ -438,11 +589,7 @@ impl StreamEngine {
                     }
                 }
                 if !uri.is_empty() {
-                    let resolved = if uri.starts_with("http://") || uri.starts_with("https://") {
-                        uri.to_string()
-                    } else {
-                        base_url.join(&uri)?.to_string()
-                    };
+                    let resolved = resolve_url_preserving_query(&base_url, &uri);
                     audio_tracks.push(HlsAudioTrack {
                         group_id,
                         uri: resolved,
@@ -452,93 +599,190 @@ impl StreamEngine {
             idx += 1;
         }
 
+        let mut selected_bandwidth: u64 = 0;
         let (video_playlist_url, maybe_audio_url) = if is_master && !variants.is_empty() {
             variants.sort_by(|a, b| b.bandwidth.cmp(&a.bandwidth));
             let best = &variants[0];
+            selected_bandwidth = best.bandwidth;
             let matched_audio = best.audio_group.as_ref().and_then(|grp| {
-                audio_tracks.iter().find(|a| &a.group_id == grp).map(|a| a.uri.clone())
+                audio_tracks
+                    .iter()
+                    .find(|a| &a.group_id == grp)
+                    .map(|a| a.uri.clone())
             });
-            info!("HLS Master: selected variant (bandwidth {}): {}", best.bandwidth, best.uri);
+            info!(
+                "HLS Master: selected variant (bandwidth {}): {}",
+                best.bandwidth, best.uri
+            );
             (best.uri.clone(), matched_audio)
         } else {
             (task.url.clone(), None)
         };
 
-        // 2. Parse media playlist segments and init map
-        let parse_playlist = |playlist_str: &str, playlist_base: &url::Url| -> (Option<String>, Vec<String>, bool) {
-            let mut init_url = None;
-            let mut segments = Vec::new();
+        // Explicit audio_url (e.g. from Floating Bar / CLI dual-stream) takes precedence over master audio group
+        let maybe_audio_url = task.audio_url.clone().or(maybe_audio_url);
+
+        // 2. Parse media playlist segments and init map with byterange support
+        let parse_playlist = |playlist_str: &str,
+                              playlist_base: &Url|
+         -> (Option<MediaChunk>, Vec<MediaChunk>, bool, f64) {
+            let mut init_chunk: Option<MediaChunk> = None;
+            let mut segments: Vec<MediaChunk> = Vec::new();
             let mut is_fmp4 = false;
+            let mut total_duration = 0.0;
+            let mut current_range: Option<(u64, u64)> = None;
+            let mut current_offset: u64 = 0;
 
             for line in playlist_str.lines() {
                 let trimmed = line.trim();
-                if trimmed.starts_with("#EXT-X-MAP:") {
+                if trimmed.starts_with("#EXTINF:") {
+                    let dur_str = trimmed["#EXTINF:".len()..]
+                        .split(',')
+                        .next()
+                        .unwrap_or("0");
+                    if let Ok(d) = dur_str.trim().parse::<f64>() {
+                        total_duration += d;
+                    }
+                } else if trimmed.starts_with("#EXT-X-BYTERANGE:") {
+                    let spec = trimmed["#EXT-X-BYTERANGE:".len()..].trim();
+                    if let Some(at_idx) = spec.find('@') {
+                        let len = spec[..at_idx].parse::<u64>().unwrap_or(0);
+                        let off = spec[at_idx + 1..].parse::<u64>().unwrap_or(0);
+                        current_offset = off + len;
+                        current_range = Some((off, off + len.saturating_sub(1)));
+                    } else if let Ok(len) = spec.parse::<u64>() {
+                        let off = current_offset;
+                        current_offset += len;
+                        current_range = Some((off, off + len.saturating_sub(1)));
+                    }
+                } else if trimmed.starts_with("#EXT-X-MAP:") {
                     is_fmp4 = true;
-                    if let Some(uri_idx) = trimmed.find("URI=\"") {
-                        let rest = &trimmed[uri_idx + 5..];
-                        if let Some(end_idx) = rest.find('"') {
-                            let map_uri = &rest[..end_idx];
-                            let resolved = if map_uri.starts_with("http://") || map_uri.starts_with("https://") {
-                                map_uri.to_string()
-                            } else if let Ok(u) = playlist_base.join(map_uri) {
-                                u.to_string()
-                            } else {
-                                map_uri.to_string()
-                            };
-                            init_url = Some(resolved);
+                    let info = &trimmed["#EXT-X-MAP:".len()..];
+                    let mut map_uri = "";
+                    let mut map_range: Option<(u64, u64)> = None;
+
+                    for part in info.split(',') {
+                        let kv: Vec<&str> = part.splitn(2, '=').collect();
+                        if kv.len() == 2 {
+                            let k = kv[0].trim();
+                            let v = kv[1].trim().trim_matches('"');
+                            if k == "URI" {
+                                map_uri = v;
+                            } else if k == "BYTERANGE" {
+                                if let Some(at) = v.find('@') {
+                                    let len = v[..at].parse::<u64>().unwrap_or(0);
+                                    let off = v[at + 1..].parse::<u64>().unwrap_or(0);
+                                    map_range = Some((off, off + len.saturating_sub(1)));
+                                }
+                            }
                         }
                     }
+
+                    if !map_uri.is_empty() {
+                        let resolved = resolve_url_preserving_query(playlist_base, map_uri);
+                        init_chunk = Some(MediaChunk {
+                            url: resolved,
+                            range: map_range,
+                        });
+                    }
                 } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    let resolved = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                        trimmed.to_string()
-                    } else if let Ok(u) = playlist_base.join(trimmed) {
-                        u.to_string()
-                    } else {
-                        trimmed.to_string()
-                    };
+                    let resolved = resolve_url_preserving_query(playlist_base, trimmed);
                     if resolved.contains(".m4s") || resolved.contains(".mp4") {
                         is_fmp4 = true;
                     }
-                    segments.push(resolved);
+                    segments.push(MediaChunk {
+                        url: resolved,
+                        range: current_range,
+                    });
+                    current_range = None; // Reset for next segment
                 }
             }
-            (init_url, segments, is_fmp4)
+            (init_chunk, segments, is_fmp4, total_duration)
         };
 
         let v_resp = client.get(&video_playlist_url).headers(headers.clone()).send().await?;
         let v_text = v_resp.text().await?;
-        let v_base = url::Url::parse(&video_playlist_url)?;
-        let (v_init, v_segs, v_fmp4) = parse_playlist(&v_text, &v_base);
+        let v_base = Url::parse(&video_playlist_url)?;
+        let (v_init, v_segs, v_fmp4, v_duration) = parse_playlist(&v_text, &v_base);
 
         if v_segs.is_empty() {
             return Err(anyhow!("No playable media segments found in HLS playlist"));
         }
 
         let total_segments = v_segs.len();
-        info!("HLS Playlist contains {} segments (fMP4={})", total_segments, v_fmp4);
+        info!(
+            "HLS Playlist contains {} segments (duration: {:.1}s, fMP4: {})",
+            total_segments, v_duration, v_fmp4
+        );
+
+        // Estimate total file size upfront so GUI displays meaningful size
+        if selected_bandwidth > 0 && v_duration > 0.0 {
+            let estimated_total = (selected_bandwidth as f64 * v_duration / 8.0) as u64;
+            let mut list = state.tasks.write().unwrap();
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.total_size = Some(estimated_total);
+            }
+        }
 
         if let Some(audio_url) = maybe_audio_url {
             info!("HLS: downloading separated video and audio tracks...");
             let a_resp = client.get(&audio_url).headers(headers.clone()).send().await?;
             let a_text = a_resp.text().await?;
-            let a_base = url::Url::parse(&audio_url)?;
-            let (a_init, a_segs, _a_fmp4) = parse_playlist(&a_text, &a_base);
+            let a_base = Url::parse(&audio_url)?;
+            let (a_init, a_segs, a_fmp4, _a_duration) = parse_playlist(&a_text, &a_base);
 
             let temp_video = task.save_path.with_extension("hls_v.tmp");
             let temp_audio = task.save_path.with_extension("hls_a.tmp");
 
+            let mut downloaded_bytes: u64 = 0;
+            let mut last_instant = Instant::now();
+            let mut last_bytes: u64 = 0;
+
             // Download Video track
             {
                 let mut v_file = tokio::fs::OpenOptions::new()
-                    .create(true).write(true).truncate(true).open(&temp_video).await?;
-                if let Some(init_url) = v_init {
-                    let init_b = client.get(&init_url).headers(headers.clone()).send().await?.bytes().await?;
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&temp_video)
+                    .await?;
+                if let Some(init_chunk) = v_init {
+                    let mut req = client.get(&init_chunk.url).headers(headers.clone());
+                    if let Some((s, e)) = init_chunk.range {
+                        req = req.header(RANGE, format!("bytes={}-{}", s, e));
+                    }
+                    let init_b = req.send().await?.bytes().await?;
                     v_file.write_all(&init_b).await?;
+                    downloaded_bytes += init_b.len() as u64;
                 }
                 for s in &v_segs {
-                    if *cancel_rx.borrow() { return Err(anyhow!("Cancelled")); }
-                    let b = client.get(s).headers(headers.clone()).send().await?.bytes().await?;
-                    v_file.write_all(&b).await?;
+                    if *cancel_rx.borrow() {
+                        return Err(anyhow!("Cancelled"));
+                    }
+                    let mut req = client.get(&s.url).headers(headers.clone());
+                    if let Some((start, end)) = s.range {
+                        req = req.header(RANGE, format!("bytes={}-{}", start, end));
+                    }
+                    if let Ok(mut r) = req.send().await {
+                        while let Some(chunk) = r.chunk().await? {
+                            v_file.write_all(&chunk).await?;
+                            downloaded_bytes += chunk.len() as u64;
+
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(last_instant).as_secs_f64();
+                            if elapsed >= 0.5 {
+                                let delta = downloaded_bytes.saturating_sub(last_bytes);
+                                let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                                last_instant = now;
+                                last_bytes = downloaded_bytes;
+                                let mut list = state.tasks.write().unwrap();
+                                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                                    t.downloaded_size = downloaded_bytes;
+                                    t.speed = speed;
+                                }
+                            }
+                        }
+                    }
                 }
                 v_file.flush().await?;
             }
@@ -546,64 +790,126 @@ impl StreamEngine {
             // Download Audio track
             {
                 let mut a_file = tokio::fs::OpenOptions::new()
-                    .create(true).write(true).truncate(true).open(&temp_audio).await?;
-                if let Some(init_url) = a_init {
-                    let init_b = client.get(&init_url).headers(headers.clone()).send().await?.bytes().await?;
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&temp_audio)
+                    .await?;
+                if let Some(init_chunk) = a_init {
+                    let mut req = client.get(&init_chunk.url).headers(headers.clone());
+                    if let Some((s, e)) = init_chunk.range {
+                        req = req.header(RANGE, format!("bytes={}-{}", s, e));
+                    }
+                    let init_b = req.send().await?.bytes().await?;
                     a_file.write_all(&init_b).await?;
+                    downloaded_bytes += init_b.len() as u64;
                 }
                 for s in &a_segs {
-                    if *cancel_rx.borrow() { return Err(anyhow!("Cancelled")); }
-                    let b = client.get(s).headers(headers.clone()).send().await?.bytes().await?;
-                    a_file.write_all(&b).await?;
+                    if *cancel_rx.borrow() {
+                        return Err(anyhow!("Cancelled"));
+                    }
+                    let mut req = client.get(&s.url).headers(headers.clone());
+                    if let Some((start, end)) = s.range {
+                        req = req.header(RANGE, format!("bytes={}-{}", start, end));
+                    }
+                    if let Ok(mut r) = req.send().await {
+                        while let Some(chunk) = r.chunk().await? {
+                            a_file.write_all(&chunk).await?;
+                            downloaded_bytes += chunk.len() as u64;
+
+                            let now = Instant::now();
+                            let elapsed = now.duration_since(last_instant).as_secs_f64();
+                            if elapsed >= 0.5 {
+                                let delta = downloaded_bytes.saturating_sub(last_bytes);
+                                let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                                last_instant = now;
+                                last_bytes = downloaded_bytes;
+                                let mut list = state.tasks.write().unwrap();
+                                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                                    t.downloaded_size = downloaded_bytes;
+                                    t.speed = speed;
+                                }
+                            }
+                        }
+                    }
                 }
                 a_file.flush().await?;
             }
 
             // Transmux video + audio with FFmpeg
-            let status = Command::new("ffmpeg")
-                .arg("-i").arg(&temp_video)
-                .arg("-i").arg(&temp_audio)
-                .arg("-c").arg("copy")
-                .arg("-bsf:a").arg("aac_adtstoasc")
-                .arg("-y").arg(&task.save_path)
-                .output().await;
+            // Only apply -bsf:a aac_adtstoasc if input was MPEG-TS (not fMP4)
+            let mut cmd = Command::new("ffmpeg");
+            cmd.arg("-i")
+                .arg(&temp_video)
+                .arg("-i")
+                .arg(&temp_audio)
+                .arg("-c")
+                .arg("copy");
+            if !v_fmp4 && !a_fmp4 {
+                cmd.arg("-bsf:a").arg("aac_adtstoasc");
+            }
+            cmd.arg("-y").arg(&task.save_path);
 
+            let status = cmd.output().await;
             let ok = status.as_ref().map(|s| s.status.success()).unwrap_or(false);
             if !ok {
-                // Retry without bsf filter
+                // Retry clean stream copy fallback
                 let _ = Command::new("ffmpeg")
-                    .arg("-i").arg(&temp_video)
-                    .arg("-i").arg(&temp_audio)
-                    .arg("-c").arg("copy")
-                    .arg("-y").arg(&task.save_path)
-                    .output().await;
+                    .arg("-i")
+                    .arg(&temp_video)
+                    .arg("-i")
+                    .arg(&temp_audio)
+                    .arg("-c")
+                    .arg("copy")
+                    .arg("-y")
+                    .arg(&task.save_path)
+                    .output()
+                    .await;
             }
 
             let _ = tokio::fs::remove_file(&temp_video).await;
             let _ = tokio::fs::remove_file(&temp_audio).await;
+
+            let meta = tokio::fs::metadata(&task.save_path).await?;
+            if meta.len() == 0 {
+                return Err(anyhow!("Muxed HLS file has 0 bytes - muxing failed"));
+            }
         } else {
             // Single track or multiplexed fMP4 / MPEG-TS
             let temp_part = task.save_path.with_extension("hls_tmp.part");
             let mut out_file = tokio::fs::OpenOptions::new()
-                .create(true).write(true).truncate(true).open(&temp_part).await?;
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_part)
+                .await?;
 
             let mut downloaded_bytes: u64 = 0;
             let mut last_instant = Instant::now();
             let mut last_bytes: u64 = 0;
 
-            if let Some(init_url) = v_init {
-                let init_b = client.get(&init_url).headers(headers.clone()).send().await?.bytes().await?;
+            if let Some(init_chunk) = v_init {
+                let mut req = client.get(&init_chunk.url).headers(headers.clone());
+                if let Some((s, e)) = init_chunk.range {
+                    req = req.header(RANGE, format!("bytes={}-{}", s, e));
+                }
+                let init_b = req.send().await?.bytes().await?;
                 out_file.write_all(&init_b).await?;
                 downloaded_bytes += init_b.len() as u64;
             }
 
-            for seg_url in &v_segs {
+            for seg in &v_segs {
                 if *cancel_rx.borrow() {
                     let _ = out_file.flush().await;
                     return Err(anyhow!("Cancelled"));
                 }
 
-                if let Ok(mut r) = client.get(seg_url).headers(headers.clone()).send().await {
+                let mut req = client.get(&seg.url).headers(headers.clone());
+                if let Some((start, end)) = seg.range {
+                    req = req.header(RANGE, format!("bytes={}-{}", start, end));
+                }
+
+                if let Ok(mut r) = req.send().await {
                     while let Some(chunk) = r.chunk().await? {
                         out_file.write_all(&chunk).await?;
                         downloaded_bytes += chunk.len() as u64;
@@ -612,7 +918,11 @@ impl StreamEngine {
                         let elapsed = now.duration_since(last_instant).as_secs_f64();
                         if elapsed >= 0.5 {
                             let delta = downloaded_bytes.saturating_sub(last_bytes);
-                            let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                            let speed = if elapsed > 0.0 {
+                                delta as f64 / elapsed
+                            } else {
+                                0.0
+                            };
                             last_instant = now;
                             last_bytes = downloaded_bytes;
 
@@ -632,14 +942,15 @@ impl StreamEngine {
             drop(out_file);
 
             if v_fmp4 {
-                // Fragmented MP4 (Twitter / X, TikTok, Vimeo fMP4):
-                // Init + m4s concatenation is already valid MP4!
-                // Fast transmux copy to optimize container; fallback to rename if ffmpeg absent
                 let ff_res = Command::new("ffmpeg")
-                    .arg("-i").arg(&temp_part)
-                    .arg("-c").arg("copy")
-                    .arg("-y").arg(&task.save_path)
-                    .output().await;
+                    .arg("-i")
+                    .arg(&temp_part)
+                    .arg("-c")
+                    .arg("copy")
+                    .arg("-y")
+                    .arg(&task.save_path)
+                    .output()
+                    .await;
 
                 if ff_res.map(|s| s.status.success()).unwrap_or(false) {
                     let _ = tokio::fs::remove_file(&temp_part).await;
@@ -647,13 +958,17 @@ impl StreamEngine {
                     let _ = tokio::fs::rename(&temp_part, &task.save_path).await;
                 }
             } else {
-                // MPEG-TS (.ts segments):
                 let ff_res = Command::new("ffmpeg")
-                    .arg("-i").arg(&temp_part)
-                    .arg("-c").arg("copy")
-                    .arg("-bsf:a").arg("aac_adtstoasc")
-                    .arg("-y").arg(&task.save_path)
-                    .output().await;
+                    .arg("-i")
+                    .arg(&temp_part)
+                    .arg("-c")
+                    .arg("copy")
+                    .arg("-bsf:a")
+                    .arg("aac_adtstoasc")
+                    .arg("-y")
+                    .arg(&task.save_path)
+                    .output()
+                    .await;
 
                 if ff_res.map(|s| s.status.success()).unwrap_or(false) {
                     let _ = tokio::fs::remove_file(&temp_part).await;
@@ -683,6 +998,674 @@ impl StreamEngine {
         );
         Ok(())
     }
+
+    /// Mode B2: MPEG-DASH (.mpd) IDM-Grade Segmented Downloader
+    /// Parses MPD XML manifest, extracts video and audio tracks, generates segment lists,
+    /// downloads concurrently and multiplexes into final container.
+    pub async fn download_dash(
+        client: &reqwest::Client,
+        task_id: &str,
+        task: &DownloadTask,
+        state: AppState,
+        cancel_rx: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        info!(
+            "⚡ StreamEngine: Starting IDM-grade MPEG-DASH (.mpd) downloader for {}",
+            task.filename
+        );
+
+        let mut headers = HeaderMap::new();
+        for (k, v) in &task.headers {
+            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
+                headers.insert(name, val);
+            }
+        }
+        if let Some(ref ua) = task.user_agent {
+            if let Ok(val) = HeaderValue::from_str(ua) {
+                headers.insert(reqwest::header::USER_AGENT, val);
+            }
+        }
+        let referer = task.headers.get("referer").or_else(|| task.headers.get("Referer"));
+        if let Some(ref_url) = referer {
+            if !ref_url.is_empty() {
+                if let Ok(val) = HeaderValue::from_str(ref_url) {
+                    headers.insert(reqwest::header::REFERER, val);
+                }
+            }
+        }
+        if let Some(ref cookie_str) = task.cookies {
+            if !cookie_str.is_empty() {
+                if let Ok(val) = HeaderValue::from_str(cookie_str) {
+                    headers.insert(reqwest::header::COOKIE, val);
+                }
+            }
+        }
+
+        headers.remove(reqwest::header::HOST);
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        headers.remove(reqwest::header::ORIGIN);
+        headers.remove("sec-fetch-mode");
+        headers.remove("sec-fetch-site");
+        headers.remove("sec-fetch-dest");
+
+        let resp = client.get(&task.url).headers(headers.clone()).send().await?;
+        let manifest_text = resp.text().await?;
+        let base_url = Url::parse(&task.url)?;
+
+        // Parse MPD XML using quick-xml
+        let mut reader = Reader::from_str(&manifest_text);
+        reader.trim_text(true);
+
+        let mut media_duration = 0.0;
+        let mut root_base_url: Option<String> = None;
+        let mut adaptation_sets: Vec<DashAdaptationSetData> = Vec::new();
+
+        let mut current_adaptation_set: Option<DashAdaptationSetData> = None;
+        let mut current_representation: Option<DashRepresentationData> = None;
+        let mut current_template: Option<DashSegmentTemplateData> = None;
+        let mut in_timeline = false;
+        let mut inside_tag = String::new();
+
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    inside_tag = tag_name.clone();
+
+                    match tag_name.as_str() {
+                        "MPD" => {
+                            for attr in e.attributes().flatten() {
+                                let key = String::from_utf8_lossy(attr.key.as_ref());
+                                if key == "mediaPresentationDuration" {
+                                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                                    if let Some(dur) = parse_iso8601_duration(&val) {
+                                        media_duration = dur;
+                                    }
+                                }
+                            }
+                        }
+                        "AdaptationSet" => {
+                            let mut is_video = false;
+                            let mut is_audio = false;
+                            for attr in e.attributes().flatten() {
+                                let key = String::from_utf8_lossy(attr.key.as_ref());
+                                let val = String::from_utf8_lossy(attr.value.as_ref()).to_lowercase();
+                                if key == "contentType" {
+                                    if val == "video" {
+                                        is_video = true;
+                                    } else if val == "audio" {
+                                        is_audio = true;
+                                    }
+                                } else if key == "mimeType" {
+                                    if val.starts_with("video/") {
+                                        is_video = true;
+                                    } else if val.starts_with("audio/") {
+                                        is_audio = true;
+                                    }
+                                }
+                            }
+                            current_adaptation_set = Some(DashAdaptationSetData {
+                                is_video,
+                                is_audio,
+                                segment_template: None,
+                                representations: Vec::new(),
+                            });
+                        }
+                        "Representation" => {
+                            let mut id = String::new();
+                            let mut bandwidth: u64 = 0;
+                            let mut is_rep_video = false;
+                            let mut is_rep_audio = false;
+
+                            for attr in e.attributes().flatten() {
+                                let key = String::from_utf8_lossy(attr.key.as_ref());
+                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                if key == "id" {
+                                    id = val.to_string();
+                                } else if key == "bandwidth" {
+                                    bandwidth = val.parse::<u64>().unwrap_or(0);
+                                } else if key == "mimeType" {
+                                    if val.starts_with("video/") {
+                                        is_rep_video = true;
+                                    } else if val.starts_with("audio/") {
+                                        is_rep_audio = true;
+                                    }
+                                }
+                            }
+
+                            if let Some(ref mut ad) = current_adaptation_set {
+                                if !ad.is_video && !ad.is_audio {
+                                    ad.is_video = is_rep_video;
+                                    ad.is_audio = is_rep_audio;
+                                }
+                            }
+
+                            current_representation = Some(DashRepresentationData {
+                                id,
+                                bandwidth,
+                                segment_template: None,
+                                initialization_url: None,
+                                initialization_range: None,
+                                segment_urls: Vec::new(),
+                                base_url: None,
+                            });
+                        }
+                        "SegmentTemplate" => {
+                            let mut tmpl = DashSegmentTemplateData {
+                                initialization: None,
+                                media: None,
+                                timescale: 1,
+                                start_number: 1,
+                                duration: 0,
+                                timeline: Vec::new(),
+                            };
+
+                            for attr in e.attributes().flatten() {
+                                let key = String::from_utf8_lossy(attr.key.as_ref());
+                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                if key == "initialization" {
+                                    tmpl.initialization = Some(val.to_string());
+                                } else if key == "media" {
+                                    tmpl.media = Some(val.to_string());
+                                } else if key == "timescale" {
+                                    tmpl.timescale = val.parse::<u64>().unwrap_or(1);
+                                } else if key == "startNumber" {
+                                    tmpl.start_number = val.parse::<u64>().unwrap_or(1);
+                                } else if key == "duration" {
+                                    tmpl.duration = val.parse::<u64>().unwrap_or(0);
+                                }
+                            }
+
+                            current_template = Some(tmpl);
+                        }
+                        "SegmentTimeline" => {
+                            in_timeline = true;
+                        }
+                        "S" => {
+                            if in_timeline {
+                                let mut t: Option<u64> = None;
+                                let mut d: u64 = 0;
+                                let mut r: Option<u64> = None;
+
+                                for attr in e.attributes().flatten() {
+                                    let key = String::from_utf8_lossy(attr.key.as_ref());
+                                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                                    if key == "t" {
+                                        t = val.parse::<u64>().ok();
+                                    } else if key == "d" {
+                                        d = val.parse::<u64>().unwrap_or(0);
+                                    } else if key == "r" {
+                                        r = val.parse::<u64>().ok();
+                                    }
+                                }
+
+                                if let Some(ref mut tmpl) = current_template {
+                                    tmpl.timeline.push((t, d, r));
+                                }
+                            }
+                        }
+                        "Initialization" => {
+                            let mut source_url: Option<String> = None;
+                            let mut range: Option<(u64, u64)> = None;
+
+                            for attr in e.attributes().flatten() {
+                                let key = String::from_utf8_lossy(attr.key.as_ref());
+                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                if key == "sourceURL" {
+                                    source_url = Some(val.to_string());
+                                } else if key == "range" {
+                                    if let Some(dash_idx) = val.find('-') {
+                                        let start = val[..dash_idx].parse::<u64>().unwrap_or(0);
+                                        let end = val[dash_idx + 1..].parse::<u64>().unwrap_or(0);
+                                        range = Some((start, end));
+                                    }
+                                }
+                            }
+
+                            if let Some(ref mut rep) = current_representation {
+                                rep.initialization_url = source_url;
+                                rep.initialization_range = range;
+                            }
+                        }
+                        "SegmentURL" => {
+                            let mut media_url = String::new();
+                            let mut media_range: Option<(u64, u64)> = None;
+
+                            for attr in e.attributes().flatten() {
+                                let key = String::from_utf8_lossy(attr.key.as_ref());
+                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                if key == "media" {
+                                    media_url = val.to_string();
+                                } else if key == "mediaRange" {
+                                    if let Some(dash_idx) = val.find('-') {
+                                        let start = val[..dash_idx].parse::<u64>().unwrap_or(0);
+                                        let end = val[dash_idx + 1..].parse::<u64>().unwrap_or(0);
+                                        media_range = Some((start, end));
+                                    }
+                                }
+                            }
+
+                            if !media_url.is_empty() {
+                                if let Some(ref mut rep) = current_representation {
+                                    rep.segment_urls.push(MediaChunk {
+                                        url: media_url,
+                                        range: media_range,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::Text(ref e)) => {
+                    if inside_tag == "BaseURL" {
+                        if let Ok(txt) = e.unescape() {
+                            let t = txt.trim().to_string();
+                            if !t.is_empty() {
+                                if let Some(ref mut rep) = current_representation {
+                                    rep.base_url = Some(t);
+                                } else if root_base_url.is_none() {
+                                    root_base_url = Some(t);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Event::End(ref e)) => {
+                    let tag_name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                    match tag_name.as_str() {
+                        "SegmentTimeline" => {
+                            in_timeline = false;
+                        }
+                        "SegmentTemplate" => {
+                            if let Some(tmpl) = current_template.take() {
+                                if let Some(ref mut rep) = current_representation {
+                                    rep.segment_template = Some(tmpl);
+                                } else if let Some(ref mut ad) = current_adaptation_set {
+                                    ad.segment_template = Some(tmpl);
+                                }
+                            }
+                        }
+                        "Representation" => {
+                            if let Some(rep) = current_representation.take() {
+                                if let Some(ref mut ad) = current_adaptation_set {
+                                    ad.representations.push(rep);
+                                }
+                            }
+                        }
+                        "AdaptationSet" => {
+                            if let Some(ad) = current_adaptation_set.take() {
+                                adaptation_sets.push(ad);
+                            }
+                        }
+                        _ => {}
+                    }
+                    inside_tag.clear();
+                }
+                Ok(Event::Eof) => break,
+                Err(err) => {
+                    warn!("Error parsing MPD XML: {:#}", err);
+                    break;
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
+
+        let effective_base_url = if let Some(ref r_base) = root_base_url {
+            base_url.join(r_base).unwrap_or_else(|_| base_url.clone())
+        } else {
+            base_url.clone()
+        };
+
+        // Separate video and audio adaptation sets
+        let mut video_reps: Vec<(DashRepresentationData, Option<DashSegmentTemplateData>)> =
+            Vec::new();
+        let mut audio_reps: Vec<(DashRepresentationData, Option<DashSegmentTemplateData>)> =
+            Vec::new();
+
+        for ad in adaptation_sets {
+            for rep in ad.representations {
+                let tmpl = rep.segment_template.clone().or_else(|| ad.segment_template.clone());
+                if ad.is_video {
+                    video_reps.push((rep, tmpl));
+                } else if ad.is_audio {
+                    audio_reps.push((rep, tmpl));
+                } else if rep.bandwidth > 500_000 {
+                    video_reps.push((rep, tmpl));
+                } else {
+                    audio_reps.push((rep, tmpl));
+                }
+            }
+        }
+
+        if video_reps.is_empty() && audio_reps.is_empty() {
+            return Err(anyhow!("No playable video or audio representations found in MPD manifest"));
+        }
+
+        // Helper to expand a representation into concrete init + media chunk URLs
+        let build_track_chunks = |rep: &DashRepresentationData,
+                                  tmpl_opt: Option<&DashSegmentTemplateData>,
+                                  track_base: &Url|
+         -> (Option<MediaChunk>, Vec<MediaChunk>) {
+            let mut init_chunk: Option<MediaChunk> = None;
+            let mut media_chunks: Vec<MediaChunk> = Vec::new();
+
+            if let Some(ref init_url) = rep.initialization_url {
+                let resolved = resolve_url_preserving_query(track_base, init_url);
+                init_chunk = Some(MediaChunk {
+                    url: resolved,
+                    range: rep.initialization_range,
+                });
+            }
+
+            if !rep.segment_urls.is_empty() {
+                for seg in &rep.segment_urls {
+                    let resolved = resolve_url_preserving_query(track_base, &seg.url);
+                    media_chunks.push(MediaChunk {
+                        url: resolved,
+                        range: seg.range,
+                    });
+                }
+                return (init_chunk, media_chunks);
+            }
+
+            if let Some(tmpl) = tmpl_opt {
+                if let Some(ref init_tmpl) = tmpl.initialization {
+                    let formatted = format_dash_template(
+                        init_tmpl,
+                        &rep.id,
+                        None,
+                        None,
+                        Some(rep.bandwidth),
+                    );
+                    let resolved = resolve_url_preserving_query(track_base, &formatted);
+                    init_chunk = Some(MediaChunk {
+                        url: resolved,
+                        range: None,
+                    });
+                }
+
+                if let Some(ref media_tmpl) = tmpl.media {
+                    if !tmpl.timeline.is_empty() {
+                        let mut curr_t: u64 = 0;
+                        let mut curr_n = tmpl.start_number;
+                        for (st, d, r) in &tmpl.timeline {
+                            if let Some(t) = st {
+                                curr_t = *t;
+                            }
+                            let repeat = r.unwrap_or(0);
+                            for _ in 0..=repeat {
+                                let formatted = format_dash_template(
+                                    media_tmpl,
+                                    &rep.id,
+                                    Some(curr_n),
+                                    Some(curr_t),
+                                    Some(rep.bandwidth),
+                                );
+                                let resolved = resolve_url_preserving_query(track_base, &formatted);
+                                media_chunks.push(MediaChunk {
+                                    url: resolved,
+                                    range: None,
+                                });
+                                curr_t += d;
+                                curr_n += 1;
+                            }
+                        }
+                    } else if tmpl.duration > 0 && media_duration > 0.0 {
+                        let seg_duration = tmpl.duration as f64 / tmpl.timescale as f64;
+                        let seg_count = (media_duration / seg_duration).ceil() as u64;
+                        for i in 0..seg_count {
+                            let n = tmpl.start_number + i;
+                            let t = i * tmpl.duration;
+                            let formatted = format_dash_template(
+                                media_tmpl,
+                                &rep.id,
+                                Some(n),
+                                Some(t),
+                                Some(rep.bandwidth),
+                            );
+                            let resolved = resolve_url_preserving_query(track_base, &formatted);
+                            media_chunks.push(MediaChunk {
+                                url: resolved,
+                                range: None,
+                            });
+                        }
+                    }
+                }
+            } else if let Some(ref b_url) = rep.base_url {
+                let resolved = resolve_url_preserving_query(track_base, b_url);
+                media_chunks.push(MediaChunk {
+                    url: resolved,
+                    range: None,
+                });
+            }
+
+            (init_chunk, media_chunks)
+        };
+
+        // Select best video and best audio representations by bandwidth
+        video_reps.sort_by(|a, b| b.0.bandwidth.cmp(&a.0.bandwidth));
+        audio_reps.sort_by(|a, b| b.0.bandwidth.cmp(&a.0.bandwidth));
+
+        let best_video = video_reps.first();
+        let best_audio = audio_reps.first();
+
+        let mut total_bw: u64 = 0;
+        if let Some((v, _)) = best_video {
+            total_bw += v.bandwidth;
+            info!(
+                "DASH: Selected highest quality video: id={}, bandwidth={}",
+                v.id, v.bandwidth
+            );
+        }
+        if let Some((a, _)) = best_audio {
+            total_bw += a.bandwidth;
+            info!(
+                "DASH: Selected highest quality audio: id={}, bandwidth={}",
+                a.id, a.bandwidth
+            );
+        }
+
+        // Estimate total file size upfront
+        if total_bw > 0 && media_duration > 0.0 {
+            let estimated_size = (total_bw as f64 * media_duration / 8.0) as u64;
+            let mut list = state.tasks.write().unwrap();
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.total_size = Some(estimated_size);
+            }
+        }
+
+        let temp_video = task.save_path.with_extension("dash_v.tmp");
+        let temp_audio = task.save_path.with_extension("dash_a.tmp");
+
+        let mut has_video = false;
+        let mut has_audio = false;
+        let mut downloaded_bytes: u64 = 0;
+        let mut last_instant = Instant::now();
+        let mut last_bytes: u64 = 0;
+
+        // Download Video track
+        if let Some((v_rep, v_tmpl)) = best_video {
+            has_video = true;
+            let (v_init, v_segs) =
+                build_track_chunks(v_rep, v_tmpl.as_ref(), &effective_base_url);
+
+            let mut v_file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_video)
+                .await?;
+
+            if let Some(init_chunk) = v_init {
+                let mut req = client.get(&init_chunk.url).headers(headers.clone());
+                if let Some((s, e)) = init_chunk.range {
+                    req = req.header(RANGE, format!("bytes={}-{}", s, e));
+                }
+                let b = req.send().await?.bytes().await?;
+                v_file.write_all(&b).await?;
+                downloaded_bytes += b.len() as u64;
+            }
+
+            for seg in &v_segs {
+                if *cancel_rx.borrow() {
+                    return Err(anyhow!("Cancelled"));
+                }
+                let mut req = client.get(&seg.url).headers(headers.clone());
+                if let Some((start, end)) = seg.range {
+                    req = req.header(RANGE, format!("bytes={}-{}", start, end));
+                }
+                if let Ok(mut r) = req.send().await {
+                    while let Some(chunk) = r.chunk().await? {
+                        v_file.write_all(&chunk).await?;
+                        downloaded_bytes += chunk.len() as u64;
+
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(last_instant).as_secs_f64();
+                        if elapsed >= 0.5 {
+                            let delta = downloaded_bytes.saturating_sub(last_bytes);
+                            let speed = if elapsed > 0.0 {
+                                delta as f64 / elapsed
+                            } else {
+                                0.0
+                            };
+                            last_instant = now;
+                            last_bytes = downloaded_bytes;
+
+                            {
+                                let mut list = state.tasks.write().unwrap();
+                                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                                    t.downloaded_size = downloaded_bytes;
+                                    t.speed = speed;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            v_file.flush().await?;
+        }
+
+        // Download Audio track
+        if let Some((a_rep, a_tmpl)) = best_audio {
+            has_audio = true;
+            let (a_init, a_segs) =
+                build_track_chunks(a_rep, a_tmpl.as_ref(), &effective_base_url);
+
+            let mut a_file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&temp_audio)
+                .await?;
+
+            if let Some(init_chunk) = a_init {
+                let mut req = client.get(&init_chunk.url).headers(headers.clone());
+                if let Some((s, e)) = init_chunk.range {
+                    req = req.header(RANGE, format!("bytes={}-{}", s, e));
+                }
+                let b = req.send().await?.bytes().await?;
+                a_file.write_all(&b).await?;
+                downloaded_bytes += b.len() as u64;
+            }
+
+            for seg in &a_segs {
+                if *cancel_rx.borrow() {
+                    return Err(anyhow!("Cancelled"));
+                }
+                let mut req = client.get(&seg.url).headers(headers.clone());
+                if let Some((start, end)) = seg.range {
+                    req = req.header(RANGE, format!("bytes={}-{}", start, end));
+                }
+                if let Ok(mut r) = req.send().await {
+                    while let Some(chunk) = r.chunk().await? {
+                        a_file.write_all(&chunk).await?;
+                        downloaded_bytes += chunk.len() as u64;
+
+                        let now = Instant::now();
+                        let elapsed = now.duration_since(last_instant).as_secs_f64();
+                        if elapsed >= 0.5 {
+                            let delta = downloaded_bytes.saturating_sub(last_bytes);
+                            let speed = if elapsed > 0.0 {
+                                delta as f64 / elapsed
+                            } else {
+                                0.0
+                            };
+                            last_instant = now;
+                            last_bytes = downloaded_bytes;
+
+                            {
+                                let mut list = state.tasks.write().unwrap();
+                                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                                    t.downloaded_size = downloaded_bytes;
+                                    t.speed = speed;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            a_file.flush().await?;
+        }
+
+        // Multiplex or finalize media
+        if has_video && has_audio {
+            info!("DASH: Multiplexing video and audio tracks with FFmpeg...");
+            crate::muxer::mux_video_and_audio(&temp_video, &temp_audio, &task.save_path).await?;
+        } else if has_video {
+            let ff_res = Command::new("ffmpeg")
+                .arg("-i")
+                .arg(&temp_video)
+                .arg("-c")
+                .arg("copy")
+                .arg("-y")
+                .arg(&task.save_path)
+                .output()
+                .await;
+            if ff_res.map(|s| s.status.success()).unwrap_or(false) {
+                let _ = tokio::fs::remove_file(&temp_video).await;
+            } else {
+                let _ = tokio::fs::rename(&temp_video, &task.save_path).await;
+            }
+        } else if has_audio {
+            let ff_res = Command::new("ffmpeg")
+                .arg("-i")
+                .arg(&temp_audio)
+                .arg("-c")
+                .arg("copy")
+                .arg("-y")
+                .arg(&task.save_path)
+                .output()
+                .await;
+            if ff_res.map(|s| s.status.success()).unwrap_or(false) {
+                let _ = tokio::fs::remove_file(&temp_audio).await;
+            } else {
+                let _ = tokio::fs::rename(&temp_audio, &task.save_path).await;
+            }
+        }
+
+        let meta = tokio::fs::metadata(&task.save_path).await?;
+        {
+            let mut list = state.tasks.write().unwrap();
+            if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                t.downloaded_size = meta.len();
+                t.total_size = Some(meta.len());
+                t.status = TaskStatus::Completed;
+                t.speed = 0.0;
+                t.completed_at = Some(chrono::Utc::now());
+            }
+        }
+        let _ = state.save_tasks().await;
+
+        info!(
+            "⚡ StreamEngine: DASH task {} completed ({} bytes)",
+            task.filename,
+            meta.len()
+        );
+        Ok(())
+    }
 }
 
 /// Helper function to download a single media track (video or audio) asynchronously
@@ -695,7 +1678,7 @@ async fn download_single_track(
     progress_tx: tokio::sync::mpsc::Sender<(bool, u64, Option<u64>)>,
     is_video: bool,
 ) -> Result<u64> {
-    let clean_url = clean_stream_url(&url);
+    let mut clean_url = clean_stream_url(&url);
     let is_googlevideo = clean_url.contains("googlevideo.com") || clean_url.contains("videoplayback");
 
     // IDM Standard: Strip browser internal & routing headers that corrupt CDN routing
@@ -713,19 +1696,17 @@ async fn download_single_track(
         .unwrap_or(0);
 
     // IDM Standard: Media streaming endpoints (like YouTube GVS CDN) STRICTLY require Range header!
-    // A bare GET without Range triggers 403 Forbidden with application/vnd.yt-ump.
     let range_header = if existing_len > 0 {
         format!("bytes={}-", existing_len)
     } else {
         "bytes=0-".to_string()
     };
-    if let Ok(range_val) = reqwest::header::HeaderValue::from_str(&range_header) {
-        headers.insert(reqwest::header::RANGE, range_val);
+    if let Ok(range_val) = HeaderValue::from_str(&range_header) {
+        headers.insert(RANGE, range_val);
     }
 
-    // IDM sends Referer: https://www.youtube.com/ for googlevideo streams, but does not force Origin
     if is_googlevideo && !headers.contains_key(reqwest::header::REFERER) {
-        if let Ok(val) = reqwest::header::HeaderValue::from_str("https://www.youtube.com/") {
+        if let Ok(val) = HeaderValue::from_str("https://www.youtube.com/") {
             headers.insert(reqwest::header::REFERER, val);
         }
     }
@@ -741,7 +1722,7 @@ async fn download_single_track(
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
         // If 403 on googlevideo, try IDM CDN fallback via 'mn' parameter (IDM VA 0x00567c91)
         if status == reqwest::StatusCode::FORBIDDEN && is_googlevideo {
-            if let Ok(u) = url::Url::parse(&clean_url) {
+            if let Ok(u) = Url::parse(&clean_url) {
                 let mn = u.query_pairs().find(|(k, _)| k == "mn").map(|(_, v)| v.to_string());
                 if let Some(mn_val) = mn {
                     let servers: Vec<&str> = mn_val.split(',').collect();
@@ -779,8 +1760,25 @@ async fn download_single_track(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
+
+    // If YouTube UMP protocol format returned, retry without ump=1 query parameter if safe
     if content_type.contains("application/vnd.yt-ump") {
-        return Err(anyhow!("Stream request returned UMP protocol error"));
+        if clean_url.contains("ump=1") {
+            clean_url = strip_query_param(&clean_url, "ump");
+            info!("Retrying without ump parameter to receive raw media container");
+            resp = client
+                .get(&clean_url)
+                .headers(headers.clone())
+                .send()
+                .await
+                .map_err(|e| anyhow!("Stream HTTP request retry failed: {}", e))?;
+            status = resp.status();
+            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                return Err(anyhow!("Stream request returned UMP protocol error"));
+            }
+        } else {
+            return Err(anyhow!("Stream request returned UMP protocol error"));
+        }
     }
 
     let is_resume_ok = existing_len > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
@@ -793,7 +1791,12 @@ async fn download_single_track(
             Some(cl)
         }
     } else {
-        None
+        // Fallback to clen from URL if Content-Length header is omitted by CDN
+        Url::parse(&clean_url).ok().and_then(|u| {
+            u.query_pairs()
+                .find(|(k, _)| k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize"))
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        })
     };
     let _ = progress_tx.send((is_video, downloaded, total_len)).await;
 
@@ -816,7 +1819,6 @@ async fn download_single_track(
             _ = cancel_rx.changed() => {
                 if *cancel_rx.borrow() {
                     let _ = file.flush().await;
-                    // Preserve partial part file on Pause - DO NOT DELETE!
                     return Err(anyhow!("Stream download cancelled by user"));
                 }
             }
@@ -831,7 +1833,6 @@ async fn download_single_track(
                     Ok(None) => break,
                     Err(e) => {
                         let _ = file.flush().await;
-                        // Preserve partial bytes on network drop
                         return Err(anyhow!("Error reading stream chunk: {}", e));
                     }
                 }
@@ -841,7 +1842,59 @@ async fn download_single_track(
 
     file.flush().await?;
     if downloaded < 1024 {
-        return Err(anyhow!("Stream track download completed with only {} bytes (invalid or error payload)", downloaded));
+        return Err(anyhow!(
+            "Stream track download completed with only {} bytes (invalid or error payload)",
+            downloaded
+        ));
     }
     Ok(downloaded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_dash_template() {
+        let t1 = "chunk-$RepresentationID$-$Number%05d$.m4s";
+        assert_eq!(
+            format_dash_template(t1, "video_1", Some(12), None, None),
+            "chunk-video_1-00012.m4s"
+        );
+
+        let t2 = "segment-$Time$.m4s";
+        assert_eq!(
+            format_dash_template(t2, "rep", None, Some(90000), None),
+            "segment-90000.m4s"
+        );
+
+        let t3 = "track-$Bandwidth$.m4s";
+        assert_eq!(
+            format_dash_template(t3, "rep", None, None, Some(2500000)),
+            "track-2500000.m4s"
+        );
+    }
+
+    #[test]
+    fn test_parse_iso8601_duration() {
+        assert_eq!(parse_iso8601_duration("PT1H2M30S"), Some(3750.0));
+        assert_eq!(parse_iso8601_duration("PT90.5S"), Some(90.5));
+        assert_eq!(parse_iso8601_duration("PT4M"), Some(240.0));
+    }
+
+    #[test]
+    fn test_resolve_url_preserving_query() {
+        let base = Url::parse("https://video.twimg.com/ext/master.m3u8?tag=12").unwrap();
+        let rel = "init.mp4";
+        assert_eq!(
+            resolve_url_preserving_query(&base, rel),
+            "https://video.twimg.com/ext/init.mp4?tag=12"
+        );
+
+        let with_own_query = "chunk.m4s?foo=bar";
+        assert_eq!(
+            resolve_url_preserving_query(&base, with_own_query),
+            "https://video.twimg.com/ext/chunk.m4s?foo=bar"
+        );
+    }
 }

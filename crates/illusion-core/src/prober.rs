@@ -1,14 +1,55 @@
+use crate::media::RequestContext;
 use anyhow::Result;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, LAST_MODIFIED, RANGE};
 use std::collections::HashMap;
 use url::Url;
 
-/// IDM-Grade Media URL Sanitizer:
-/// Strips subsegment chunk bounds (`bytestart`, `byteend`, `range`, `sq`, `segment`)
-/// so that multi-segment parallel HTTP Range requests can download the entire file.
-/// CRITICAL: Preserves all HMAC parameters signed in `sparams` (e.g. YouTube GoogleVideo).
+/// A browser-captured media URL is immutable. In particular, signed CDN URLs
+/// often include parameters that look like ranges but are part of the request
+/// capability. The downloader adds its own `Range` header when appropriate.
 pub fn clean_media_url(raw_url: &str) -> String {
-    crate::stream_engine::clean_stream_url(raw_url)
+    raw_url.to_string()
+}
+
+pub fn build_request_headers(
+    extra_headers: &HashMap<String, String>,
+    cookies: Option<&str>,
+    user_agent: Option<&str>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (key, value) in extra_headers {
+        let lower = key.to_ascii_lowercase();
+        // These are generated for each download request and must never be
+        // copied from a browser connection. `Origin`, `Referer`, auth headers,
+        // and cookies are intentionally retained when captured.
+        if matches!(lower.as_str(), "host" | "content-length" | "range" | "accept-encoding" | "connection")
+            || lower.starts_with("sec-fetch-")
+            || lower.starts_with("sec-ch-")
+        {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (key.parse::<reqwest::header::HeaderName>(), HeaderValue::from_str(value)) {
+            headers.insert(name, value);
+        }
+    }
+
+    if let Some(value) = user_agent.filter(|value| !value.is_empty()) {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(reqwest::header::USER_AGENT, value);
+        }
+    }
+    if !headers.contains_key(reqwest::header::USER_AGENT) {
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+        );
+    }
+    if let Some(value) = cookies.filter(|value| !value.is_empty()) {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(reqwest::header::COOKIE, value);
+        }
+    }
+    headers
 }
 
 #[derive(Debug, Clone)]
@@ -28,53 +69,53 @@ pub async fn probe_url(
     extra_headers: Option<&HashMap<String, String>>,
     suggested_filename: Option<&str>,
 ) -> Result<RemoteInfo> {
-    let clean_url = clean_media_url(url_str);
-    let parsed_url = Url::parse(&clean_url)?;
-    let mut custom_headers = HeaderMap::new();
+    let context = RequestContext {
+        url: url_str.to_string(),
+        headers: extra_headers.cloned().unwrap_or_default(),
+        ..RequestContext::default()
+    };
+    probe_request(client, &context, suggested_filename).await
+}
 
-    if let Some(headers) = extra_headers {
-        for (k, v) in headers {
-            let k_lower = k.to_lowercase();
-            if k_lower == "host" || k_lower == "content-length" || k_lower == "origin" 
-               || k_lower.starts_with("sec-fetch-") {
-                continue;
-            }
-            if let (Ok(name), Ok(val)) = (k.parse::<reqwest::header::HeaderName>(), HeaderValue::from_str(v)) {
-                custom_headers.insert(name, val);
-            }
-        }
-    }
+pub async fn probe_request(
+    client: &reqwest::Client,
+    context: &RequestContext,
+    suggested_filename: Option<&str>,
+) -> Result<RemoteInfo> {
+    let raw_url = clean_media_url(&context.url);
+    let parsed_url = Url::parse(&raw_url)?;
+    let custom_headers = build_request_headers(
+        &context.normalized_headers(),
+        context.cookies.as_deref(),
+        context.user_agent.as_deref(),
+    );
+    let content_type_hint = context.content_type.as_deref().unwrap_or_default().to_ascii_lowercase();
+    let is_manifest = raw_url.contains(".m3u8")
+        || raw_url.contains(".mpd")
+        || content_type_hint.contains("mpegurl")
+        || content_type_hint.contains("dash+xml");
 
-    if !custom_headers.contains_key(reqwest::header::USER_AGENT) {
-        custom_headers.insert(
-            reqwest::header::USER_AGENT,
-            HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
-        );
-    }
-
-    let is_googlevideo = parsed_url.host_str().map_or(false, |h| h.contains("googlevideo.com"));
-    if is_googlevideo {
-        if !custom_headers.contains_key(reqwest::header::REFERER) {
-            custom_headers.insert(
-                reqwest::header::REFERER,
-                HeaderValue::from_static("https://www.youtube.com/"),
-            );
-        }
-    }
-
-    // Try HEAD request first (skip for googlevideo/streaming CDNs which reject HEAD with 403)
-    let resp = if is_googlevideo {
+    // Try HEAD request first (skip for googlevideo/streaming CDNs and segmented playlists)
+    let resp = if is_manifest {
         None
     } else {
-        let head_req = client.head(&clean_url).headers(custom_headers.clone());
+        let head_req = client.head(&raw_url).headers(custom_headers.clone());
         head_req.send().await.ok()
     };
 
-    let mut total_size: Option<u64> = None;
+    let mut total_size: Option<u64> = context.content_length;
     let mut accept_ranges = false;
     let mut etag = None;
     let mut last_modified = None;
-    let mut content_type = None;
+    let mut content_type = if raw_url.contains(".mpd") {
+        Some("application/dash+xml".to_string())
+    } else if raw_url.contains(".m3u8") {
+        Some("application/vnd.apple.mpegurl".to_string())
+    } else if !content_type_hint.is_empty() {
+        Some(content_type_hint)
+    } else {
+        None
+    };
     let mut disposition_filename = None;
 
     if let Some(ref r) = resp {
@@ -119,24 +160,26 @@ pub async fn probe_url(
         }
     }
 
-    // Check for clen in query parameters (common in streaming media like YouTube/GoogleVideo)
+    // Check for clen / filesize in query parameters (common in streaming media like YouTube/GoogleVideo)
     for (k, v) in parsed_url.query_pairs() {
-        if k == "clen" {
+        if k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize") || k.eq_ignore_ascii_case("size") {
             if let Ok(s) = v.parse::<u64>() {
-                total_size = Some(s);
-                accept_ranges = true;
+                if s > 0 {
+                    total_size = Some(s);
+                    accept_ranges = true;
+                    break;
+                }
             }
-            break;
         }
     }
 
     // If HEAD failed or gave no content-length, and total_size is still unknown, probe with Range GET bytes=0-
-    // (IDM Standard 0x00567c91: Always send "bytes=0-" rather than "bytes=0-0")
-    if total_size.is_none() {
+    // (skip for HLS/DASH manifest playlists)
+    if total_size.is_none() && !is_manifest {
         let mut probe_headers = custom_headers.clone();
         probe_headers.insert(RANGE, HeaderValue::from_static("bytes=0-"));
 
-        let get_resp = client.get(&clean_url).headers(probe_headers).send().await;
+        let get_resp = client.get(&raw_url).headers(probe_headers).send().await;
         if let Ok(resp) = get_resp {
             let status = resp.status();
             let headers = resp.headers();
@@ -177,10 +220,6 @@ pub async fn probe_url(
                         }
                     }
                 }
-            } else if status.as_u16() == 403 {
-                // Streaming CDNs (e.g. YouTube, Pinterest, Twitter) may disallow raw probe GETs;
-                // allow stream engine to proceed with direct single-stream GET
-                accept_ranges = true;
             }
         }
     }
@@ -197,7 +236,7 @@ pub async fn probe_url(
     };
 
     Ok(RemoteInfo {
-        url: clean_url,
+        url: raw_url,
         filename: final_filename,
         total_size,
         accept_ranges,

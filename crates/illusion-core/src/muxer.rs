@@ -12,9 +12,10 @@ pub async fn mux_video_and_audio(
     audio_path: &Path,
     output_path: &Path,
 ) -> Result<()> {
-    let output_temp = output_path.with_extension("muxing_temp.mp4");
+    let ext = output_path.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_lowercase();
+    let output_temp = output_path.with_extension(format!("muxing_temp.{}", ext));
 
-    info!("⚡ Muxer: Attempting stream-copy muxing for {:?} + {:?}", video_path, audio_path);
+    info!("⚡ Muxer: Attempting stream-copy muxing for {:?} + {:?} into .{}", video_path, audio_path, ext);
 
     // Attempt 1: Direct stream copy (instant, 0% CPU overhead, matches official IDM)
     let status = Command::new("ffmpeg")
@@ -47,18 +48,22 @@ pub async fn mux_video_and_audio(
     };
 
     if !success {
-        // Attempt 2: Copy video directly (-c:v copy) and encode audio to standard AAC
-        let fallback_status = Command::new("ffmpeg")
-            .arg("-i")
+        // Attempt 2: Copy video directly (-c:v copy) and encode audio to standard container audio
+        let mut cmd = Command::new("ffmpeg");
+        cmd.arg("-i")
             .arg(video_path)
             .arg("-i")
             .arg(audio_path)
             .arg("-c:v")
-            .arg("copy")
-            .arg("-c:a")
-            .arg("aac")
-            .arg("-b:a")
-            .arg("192k")
+            .arg("copy");
+
+        if ext == "webm" {
+            cmd.arg("-c:a").arg("libopus").arg("-b:a").arg("128k");
+        } else {
+            cmd.arg("-c:a").arg("aac").arg("-b:a").arg("192k");
+        }
+
+        let fallback_status = cmd
             .arg("-map")
             .arg("0:v:0")
             .arg("-map")
