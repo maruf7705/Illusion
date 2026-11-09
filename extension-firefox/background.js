@@ -20,13 +20,9 @@ const headerRingBuffer = new Map();
 const RING_BUFFER_TTL_MS = 60 * 1000;
 
 function cleanUrlForCorrelation(url) {
-  if (!url) return "";
-  try {
-    const u = new URL(url);
-    return `${u.origin}${u.pathname}`;
-  } catch (_) {
-    return url.split("?")[0];
-  }
+  // Correlation must use the exact signed request URL.  Dropping its query
+  // string can attach cookies/headers from a different playback request.
+  return typeof url === "string" ? url : "";
 }
 
 function storeInRingBuffer(url, details) {
@@ -64,6 +60,64 @@ function getFromRingBuffer(url) {
   return null;
 }
 
+function responseLength(headers) {
+  const contentRange = headers["content-range"] || "";
+  const total = contentRange.match(/\/([0-9]+)$/);
+  if (total) return Number(total[1]) || null;
+  const length = Number(headers["content-length"] || 0);
+  return length > 0 ? length : null;
+}
+
+function candidateKind(url, mime, isProtected) {
+  const lower = `${url} ${mime}`.toLowerCase();
+  if (isProtected || url.startsWith("blob:")) return "protected_or_unsupported";
+  if (lower.includes(".m3u8") || lower.includes("mpegurl")) return "hls_manifest";
+  if (lower.includes(".mpd") || lower.includes("dash+xml")) return "dash_manifest";
+  return "progressive";
+}
+
+function requestContext(url, tabId, pageUrl, metadata = {}) {
+  const ring = getFromRingBuffer(url) || {};
+  // `headers` are request headers captured before playback.  Response headers
+  // are represented only by typed metadata below and must never be replayed.
+  const headers = { ...(ring.headers || {}) };
+  const referer = headers.referer || headers.Referer || ring.referer || pageUrl || "";
+  const origin = headers.origin || headers.Origin || "";
+  return {
+    url,
+    headers,
+    cookies: headers.cookie || headers.Cookie || "",
+    userAgent: headers["user-agent"] || headers["User-Agent"] || ring.userAgent || navigator.userAgent,
+    referer,
+    origin,
+    contentType: metadata.contentType || "",
+    contentLength: metadata.contentLength || null,
+    acceptRanges: Boolean(metadata.acceptRanges)
+  };
+}
+
+function makeCandidate(tabId, stream, pageUrl, primaryMetadata = {}) {
+  const primary = requestContext(stream.url, tabId, pageUrl, primaryMetadata);
+  const audio = stream.audioUrl
+    ? requestContext(stream.audioUrl, tabId, pageUrl, stream.audioMetadata || {})
+    : null;
+  const protectedReason = stream.protectedReason || null;
+  return {
+    id: `${tabId}:${primary.url}:${Date.now()}`,
+    kind: protectedReason
+      ? "protected_or_unsupported"
+      : audio
+        ? "paired_audio_video"
+        : candidateKind(primary.url, primary.contentType || stream.mime || "", false),
+    pageUrl: pageUrl || "",
+    primary,
+    audio,
+    quality: stream.quality || "",
+    codecs: stream.codecs || "",
+    unsupportedReason: protectedReason
+  };
+}
+
 // Capture request headers via webRequest (extraHeaders allows Cookie, Referer, Authorization)
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
@@ -87,12 +141,11 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     });
   },
   { urls: ["<all_urls>"] },
-  ["requestHeaders"]
+  ["requestHeaders", "extraHeaders"]
 );
 
 // 2. In-memory stream cache per tab with chrome.storage.session persistence
 const tabStreams = new Map();
-const tabAudioStreams = new Map();
 
 async function saveTabStreams(tabId, streams) {
   tabStreams.set(tabId, streams);
@@ -121,7 +174,6 @@ async function getTabStreams(tabId) {
 
 async function removeTabStreams(tabId) {
   tabStreams.delete(tabId);
-  tabAudioStreams.delete(tabId);
   if (chrome.storage && chrome.storage.session) {
     try {
       await chrome.storage.session.remove(`tab_${tabId}`);
@@ -202,14 +254,22 @@ async function handleMediaResponse(tabId, details) {
 
   let contentType = "";
   let contentLength = 0;
+  let acceptRanges = false;
+  const responseHeaders = {};
 
   if (details.responseHeaders) {
     for (const h of details.responseHeaders) {
       const name = h.name.toLowerCase();
+      responseHeaders[name] = h.value || "";
       if (name === "content-type") {
         contentType = h.value ? h.value.toLowerCase() : "";
       } else if (name === "content-length") {
         contentLength = parseInt(h.value || "0", 10) || 0;
+      } else if (name === "content-range") {
+        const total = responseLength(responseHeaders);
+        if (total) contentLength = total;
+      } else if (name === "accept-ranges") {
+        acceptRanges = (h.value || "").toLowerCase() === "bytes";
       }
     }
   }
@@ -271,42 +331,31 @@ async function handleMediaResponse(tabId, details) {
     const isAudioItag = ["140", "251", "250", "249", "171", "258", "256"].includes(itag);
     const isAudio = contentType.startsWith("audio/") || cleanUrl.endsWith(".m4a") || cleanUrl.endsWith(".mp3") || isAudioItag;
 
-    // Extract exact file size from query params (e.g. YouTube clen, Twitter/Facebook filesize)
+    // Unknown is a valid size.  Do not invent a number from URL parameters.
     let sizeBytes = contentLength;
-    if (!sizeBytes || sizeBytes === 0) {
-      try {
-        const u = new URL(url);
-        const clen = u.searchParams.get("clen") || u.searchParams.get("filesize") || u.searchParams.get("size");
-        if (clen) {
-          const parsed = parseInt(clen, 10);
-          if (parsed > 0) sizeBytes = parsed;
-        }
-      } catch (_) {}
-    }
     if (isPlaylist) {
       sizeBytes = 0; // Don't show misleading 1 KB manifest size as video size
     }
 
-    if (isAudio) {
-      tabAudioStreams.set(tabId, targetDownloadUrl);
-      // Automatically link this discovered audio stream with all existing video streams in this tab!
-      streams.forEach((s) => {
-        if (!s.isAudio && !s.audioUrl) {
-          s.audioUrl = targetDownloadUrl;
-        }
-      });
-    }
-
     if (!streams.some((s) => s.url === targetDownloadUrl)) {
-      const activeAudio = isAudio ? null : (tabAudioStreams.get(tabId) || null);
       const quality = inferQuality(url, contentType, sizeBytes);
       const item = {
         url: targetDownloadUrl,
         mime: contentType || (isYouTubePlayback ? "video/mp4" : "application/octet-stream"),
         size: sizeBytes,
         quality: quality,
-        audioUrl: activeAudio,
+        audioUrl: null,
         isAudio: isAudio,
+        candidate: makeCandidate(tabId, {
+          url: targetDownloadUrl,
+          mime: contentType,
+          quality,
+          audioUrl: null
+        }, "", {
+          contentType,
+          contentLength: sizeBytes || null,
+          acceptRanges
+        }),
         timestamp: Date.now()
       };
       if (isPlaylist) {
@@ -514,6 +563,18 @@ async function sendToIllusion(details) {
       mergedHeaders.cookie = cookiesStr;
     }
 
+    const candidate = details.candidate || makeCandidate(-1, {
+      url: details.url,
+      audioUrl: details.audio_url || null,
+      quality: details.quality || ""
+    }, details.referer || "");
+    for (const context of [candidate.primary, candidate.audio].filter(Boolean)) {
+      if (!context.cookies && cookiesStr) context.cookies = cookiesStr;
+      if (!context.referer) context.referer = details.referer || ringData.referer || "";
+      if (!context.userAgent) context.userAgent = navigator.userAgent;
+      context.headers = Object.assign({}, mergedHeaders, context.headers || {});
+    }
+
     const payload = {
       action: "add_download",
       url: details.url,
@@ -523,7 +584,8 @@ async function sendToIllusion(details) {
       user_agent: navigator.userAgent,
       audio_url: details.audio_url || null,
       quality: details.quality || "",
-      headers: mergedHeaders
+      headers: mergedHeaders,
+      media_candidate: candidate
     };
 
     // 1. Primary Channel: IDM-Grade Local HTTP Loopback Bridge (127.0.0.1:9095)
@@ -605,32 +667,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         const isAudioItag = ["140", "251", "250", "249", "171", "258", "256"].includes(itag);
         const isAudio = (request.stream.mime || "").startsWith("audio/") || isAudioItag;
 
-        if (request.stream.audioUrl) {
-          tabAudioStreams.set(tabId, request.stream.audioUrl);
-        } else if (isAudio) {
-          tabAudioStreams.set(tabId, streamUrl);
-        }
-
-        const activeAudio = isAudio ? null : (request.stream.audioUrl || tabAudioStreams.get(tabId) || null);
-
-        // Retroactively link audio with any unlinked video stream
-        if (activeAudio) {
-          streams.forEach((s) => {
-            if (!s.isAudio && !s.audioUrl) {
-              s.audioUrl = activeAudio;
-            }
-          });
-        }
-
-        // Match by itag or exact URL
+        // Match by exact URL.  Reusing an itag from another playback can
+        // cross-wire signed requests from different videos.
         const existingIdx = streams.findIndex((s) => {
-          if (s.url === streamUrl) return true;
-          if (itag) {
-            try {
-              return new URL(s.url).searchParams.get("itag") === itag;
-            } catch (_) {}
-          }
-          return false;
+          return s.url === streamUrl;
         });
 
         const newItem = {
@@ -638,9 +678,13 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
           mime: request.stream.mime || "video/mp4",
           quality: request.stream.quality || "720p HD",
           size: request.stream.size || 0,
-          audioUrl: activeAudio,
+          audioUrl: request.stream.audioUrl || null,
           isAudio: isAudio,
           codecs: request.stream.codecs || null,
+          candidate: makeCandidate(tabId, request.stream, sender.tab ? sender.tab.url : "", {
+            contentType: request.stream.mime || "",
+            contentLength: Number(request.stream.size) || null
+          }),
           timestamp: Date.now()
         };
 
@@ -664,13 +708,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   // User clicked a download row in the Floating Bar UI
   if (request.type === "START_VIDEO_DOWNLOAD" || request.type === "MEDIA_SNIFFED_DOWNLOAD") {
     const referer = request.page_url || (sender.tab ? sender.tab.url : "");
-    const activeAudio = request.audio_url || tabAudioStreams.get(tabId) || null;
+    const selected = request.candidate || null;
+    const candidate = selected || makeCandidate(tabId, {
+      url: request.url,
+      audioUrl: request.audio_url || null,
+      quality: request.quality || ""
+    }, referer);
     sendToIllusion({
       url: request.url,
       filename: request.filename || "",
       referer: referer,
-      audio_url: activeAudio,
-      quality: request.quality || ""
+      audio_url: request.audio_url || null,
+      quality: request.quality || "",
+      candidate
     }).then(() => {
       sendResponse({ status: "success" });
     });

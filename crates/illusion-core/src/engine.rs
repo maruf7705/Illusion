@@ -276,13 +276,14 @@ impl DownloadEngine {
                             "Incomplete response: expected {} bytes, wrote {} bytes",
                             expected, written_size
                         );
-                        let mut list = state.tasks.write().unwrap();
-                        if let Some(download) = list.iter_mut().find(|download| download.id == task_id) {
-                            download.status = TaskStatus::Error;
-                            download.error_message = Some(message.clone());
-                            download.speed = 0.0;
+                        {
+                            let mut list = state.tasks.write().unwrap();
+                            if let Some(download) = list.iter_mut().find(|download| download.id == task_id) {
+                                download.status = TaskStatus::Error;
+                                download.error_message = Some(message.clone());
+                                download.speed = 0.0;
+                            }
                         }
-                        drop(list);
                         let _ = state.save_tasks().await;
                         return Err(anyhow!(message));
                     }

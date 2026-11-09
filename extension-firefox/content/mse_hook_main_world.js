@@ -10,19 +10,7 @@
   const capturedCodecs = [];
 
   function cleanUrl(url) {
-    if (!url || typeof url !== "string") return "";
-    try {
-      const u = new URL(url);
-      const sparams = (u.searchParams.get("sparams") || "").split(",");
-      // CRITICAL: Never strip parameters that are signed by Google Video sparams HMAC!
-      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag", "sabr", "rqh", "ump", "len", "begin"].forEach((p) => {
-        if (!sparams.includes(p)) {
-          u.searchParams.delete(p);
-        }
-      });
-      return u.toString();
-    } catch (_) {}
-    return url;
+    return typeof url === "string" ? url : "";
   }
 
   const ytItagMap = {
@@ -44,8 +32,6 @@
 
   let lastActivePlaybackUrl = null;
   const liveItagUrls = new Map();
-  let lastActiveAudioUrl = null;
-  let lastActiveVideoUrl = null;
 
   function trackPlaybackUrl(url) {
     if (!url || typeof url !== "string") return;
@@ -57,12 +43,6 @@
         if (itag) {
           liveItagUrls.set(itag, cleaned);
           const isAudio = ["140", "251", "250", "249"].includes(itag);
-          if (isAudio) {
-            lastActiveAudioUrl = cleaned;
-          } else {
-            lastActiveVideoUrl = cleaned;
-          }
-
           // Emit the live, deciphered stream immediately to detector & floating bar
           const info = ytItagMap[itag] || { q: isAudio ? "Audio Track" : "720p HD", m: isAudio ? "audio/mp4" : "video/mp4" };
           emitMediaDiscovery({
@@ -70,23 +50,8 @@
             quality: info.q,
             mime: info.m,
             size: 0,
-            audioUrl: isAudio ? null : lastActiveAudioUrl
+            audioUrl: null
           });
-
-          // If this is an audio track and we already have an active video stream, link them for dual-stream download
-          if (isAudio && lastActiveVideoUrl) {
-            try {
-              const vItag = new URL(lastActiveVideoUrl).searchParams.get("itag");
-              const vInfo = ytItagMap[vItag] || { q: "720p HD", m: "video/mp4" };
-              emitMediaDiscovery({
-                url: lastActiveVideoUrl,
-                quality: vInfo.q,
-                mime: vInfo.m,
-                size: 0,
-                audioUrl: cleaned
-              });
-            } catch (_) {}
-          }
         }
         lastActivePlaybackUrl = cleaned;
       }
@@ -231,7 +196,7 @@
     const adaptive = streaming.adaptiveFormats || [];
 
     // Find best audio URL
-    let bestAudioUrl = lastActiveAudioUrl || liveItagUrls.get("140") || liveItagUrls.get("251");
+    let bestAudioUrl = null;
     if (!bestAudioUrl) {
       for (const fmt of adaptive) {
         if (fmt.mimeType && fmt.mimeType.includes("audio")) {

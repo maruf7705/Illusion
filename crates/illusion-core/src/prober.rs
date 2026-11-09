@@ -160,19 +160,6 @@ pub async fn probe_request(
         }
     }
 
-    // Check for clen / filesize in query parameters (common in streaming media like YouTube/GoogleVideo)
-    for (k, v) in parsed_url.query_pairs() {
-        if k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize") || k.eq_ignore_ascii_case("size") {
-            if let Ok(s) = v.parse::<u64>() {
-                if s > 0 {
-                    total_size = Some(s);
-                    accept_ranges = true;
-                    break;
-                }
-            }
-        }
-    }
-
     // If HEAD failed or gave no content-length, and total_size is still unknown, probe with Range GET bytes=0-
     // (skip for HLS/DASH manifest playlists)
     if total_size.is_none() && !is_manifest {

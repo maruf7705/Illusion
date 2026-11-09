@@ -18,20 +18,9 @@
   let pollInterval = null;
 
   function cleanMediaUrl(url) {
-    if (!url || typeof url !== "string") return "";
-    try {
-      const u = new URL(url);
-      const sparams = (u.searchParams.get("sparams") || "").split(",");
-      // CRITICAL: Never strip parameters that are signed by Google Video sparams HMAC!
-      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag", "sabr", "rqh", "ump", "len", "begin"].forEach((p) => {
-        if (!sparams.includes(p)) {
-          u.searchParams.delete(p);
-        }
-      });
-      return u.toString();
-    } catch (_) {
-      return url;
-    }
+    // A playback URL can be signed.  The UI may display it, but must never
+    // normalize, decode, or remove any of its query parameters.
+    return typeof url === "string" ? url : "";
   }
 
   function addStream(stream) {
@@ -50,14 +39,6 @@
     }
     if (itag) {
       stream.itag = itag.toString();
-    }
-
-    if (!stream.size || stream.size === 0) {
-      try {
-        const u = new URL(url);
-        const clen = u.searchParams.get("clen") || u.searchParams.get("filesize") || u.searchParams.get("size");
-        if (clen) stream.size = parseInt(clen, 10) || 0;
-      } catch (_) {}
     }
 
     const idx = currentStreams.findIndex((s) => {
@@ -80,15 +61,6 @@
       };
     } else {
       currentStreams.push(stream);
-    }
-
-    // Propagate audioUrl to any video stream that lacks an audio pairing
-    if (stream.audioUrl) {
-      currentStreams.forEach((s) => {
-        if (!s.audioUrl && !(s.mime || "").includes("audio")) {
-          s.audioUrl = stream.audioUrl;
-        }
-      });
     }
 
     window.__ILLUSION_DISCOVERED_STREAMS__ = currentStreams;
@@ -775,15 +747,9 @@
     const ext = stream.mime && stream.mime.includes("audio") ? ".m4a" : ".mp4";
     const filename = title.replace(/[^a-zA-Z0-9_\-\. ]/g, "_").trim() + ext;
 
-    // Guarantee audio track pairing for separated adaptive streams (YouTube, Facebook, Vimeo, etc.)
-    let effectiveAudioUrl = stream.audioUrl || null;
-    const isVideo = !stream.mime || !stream.mime.includes("audio");
-    if (!effectiveAudioUrl && isVideo) {
-      const audioMatch = currentStreams.find(s => (s.mime && s.mime.includes("audio")) || (s.quality && s.quality.toLowerCase().includes("audio")) || ["140", "251", "250", "249"].includes(s.itag));
-      if (audioMatch && audioMatch.url && audioMatch.url !== stream.url) {
-        effectiveAudioUrl = audioMatch.url;
-      }
-    }
+    // Only an explicit capture correlation is allowed to pair audio.  The
+    // first audio request in a tab is not necessarily this video’s track.
+    const effectiveAudioUrl = stream.audioUrl || null;
 
     const payload = {
       action: "add_download",
@@ -792,13 +758,7 @@
       referer: window.location.href,
       audio_url: effectiveAudioUrl,
       quality: stream.quality || "",
-      headers: {
-        Referer: window.location.href,
-        "User-Agent": navigator.userAgent
-      }
-    };
-      audio_url: effectiveAudioUrl,
-      quality: stream.quality || "",
+      media_candidate: stream.candidate || null,
       headers: {
         Referer: window.location.href,
         "User-Agent": navigator.userAgent
@@ -817,7 +777,8 @@
             filename: filename,
             audio_url: effectiveAudioUrl,
             page_url: window.location.href,
-            quality: stream.quality || ""
+            quality: stream.quality || "",
+            candidate: stream.candidate || null
           }, (response) => {
             if (chrome.runtime.lastError || (response && response.status === "error")) {
               resolve(false);

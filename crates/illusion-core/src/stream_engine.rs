@@ -228,27 +228,20 @@ impl StreamEngine {
         state: AppState,
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<()> {
-        let audio_url = task
-            .audio_url
-            .as_ref()
-            .ok_or_else(|| anyhow!("Dual-stream download requires audio_url"))?;
+        let video_request = task.primary_request();
+        let audio_request = task
+            .audio_request()
+            .ok_or_else(|| anyhow!("Dual-stream download requires an independently captured audio request"))?;
 
         info!(
             "⚡ StreamEngine: Dispatching IDM-grade dual-stream download for {}",
             task.filename
         );
 
-        // Pre-parse clen (content length) from query parameters upfront so file size is known before download
-        let v_clen = Url::parse(&task.url).ok().and_then(|u| {
-            u.query_pairs()
-                .find(|(k, _)| k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize"))
-                .and_then(|(_, v)| v.parse::<u64>().ok())
-        });
-        let a_clen = Url::parse(audio_url).ok().and_then(|u| {
-            u.query_pairs()
-                .find(|(k, _)| k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize"))
-                .and_then(|(_, v)| v.parse::<u64>().ok())
-        });
+        // Missing response metadata remains unknown until a valid response
+        // probe or the completed download establishes the byte count.
+        let v_clen = video_request.content_length;
+        let a_clen = audio_request.content_length;
         if let (Some(v), Some(a)) = (v_clen, a_clen) {
             let mut list = state.tasks.write().unwrap();
             if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
@@ -259,50 +252,25 @@ impl StreamEngine {
         let video_part = task.save_path.with_extension("video_part.mp4");
         let audio_part = task.save_path.with_extension("audio_part.m4a");
 
-        // Build common request headers
-        let mut headers = HeaderMap::new();
-        for (k, v) in &task.headers {
-            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
-                headers.insert(name, val);
-            }
-        }
-        if let Some(ref ua) = task.user_agent {
-            if let Ok(val) = HeaderValue::from_str(ua) {
-                headers.insert(reqwest::header::USER_AGENT, val);
-            }
-        }
-        let referer = task.headers.get("referer").or_else(|| task.headers.get("Referer"));
-        if let Some(ref_url) = referer {
-            if !ref_url.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(ref_url) {
-                    headers.insert(reqwest::header::REFERER, val);
-                }
-            }
-        }
-        if let Some(ref cookie_str) = task.cookies {
-            if !cookie_str.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(cookie_str) {
-                    headers.insert(reqwest::header::COOKIE, val);
-                }
-            }
-        }
-
-        // IDM Standard: Strip browser internal headers that interfere with CDN token routing
-        headers.remove(reqwest::header::HOST);
-        headers.remove(reqwest::header::CONTENT_LENGTH);
-        headers.remove(reqwest::header::ORIGIN);
-        headers.remove("sec-fetch-mode");
-        headers.remove("sec-fetch-site");
-        headers.remove("sec-fetch-dest");
+        let video_headers = build_request_headers(
+            &video_request.normalized_headers(),
+            video_request.cookies.as_deref(),
+            video_request.user_agent.as_deref(),
+        );
+        let audio_headers = build_request_headers(
+            &audio_request.normalized_headers(),
+            audio_request.cookies.as_deref(),
+            audio_request.user_agent.as_deref(),
+        );
 
         let (progress_tx, mut progress_rx) =
             tokio::sync::mpsc::channel::<(bool, u64, Option<u64>)>(256);
 
         // Spawn concurrent video download task
         let v_client = client.clone();
-        let v_url = clean_stream_url(&task.url);
+        let v_url = video_request.url;
         let v_path = video_part.clone();
-        let v_headers = headers.clone();
+        let v_headers = video_headers;
         let v_cancel = cancel_rx.clone();
         let v_tx = progress_tx.clone();
         let video_handle = tokio::spawn(async move {
@@ -311,9 +279,9 @@ impl StreamEngine {
 
         // Spawn concurrent audio download task
         let a_client = client.clone();
-        let a_url = clean_stream_url(audio_url);
+        let a_url = audio_request.url;
         let a_path = audio_part.clone();
-        let a_headers = headers.clone();
+        let a_headers = audio_headers;
         let a_cancel = cancel_rx.clone();
         let a_tx = progress_tx.clone();
         let audio_handle = tokio::spawn(async move {
@@ -338,9 +306,7 @@ impl StreamEngine {
                 }
                 let combined_total = match (video_total, audio_total) {
                     (Some(v), Some(a)) => Some(v + a),
-                    (Some(v), None) => Some(v),
-                    (None, Some(a)) => Some(a),
-                    (None, None) => None,
+                    _ => None,
                 };
                 {
                     let mut list = state.tasks.write().unwrap();
@@ -437,45 +403,28 @@ impl StreamEngine {
             task.filename
         );
 
-        let mut headers = HeaderMap::new();
-        for (k, v) in &task.headers {
-            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
-                headers.insert(name, val);
-            }
-        }
-        if let Some(ref ua) = task.user_agent {
-            if let Ok(val) = HeaderValue::from_str(ua) {
-                headers.insert(reqwest::header::USER_AGENT, val);
-            }
-        }
-        let referer = task.headers.get("referer").or_else(|| task.headers.get("Referer"));
-        if let Some(ref_url) = referer {
-            if !ref_url.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(ref_url) {
-                    headers.insert(reqwest::header::REFERER, val);
-                }
-            }
-        }
-        if let Some(ref cookie_str) = task.cookies {
-            if !cookie_str.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(cookie_str) {
-                    headers.insert(reqwest::header::COOKIE, val);
-                }
-            }
-        }
-
-        // IDM Standard: Strip browser internal headers that interfere with CDN token routing
-        headers.remove(reqwest::header::HOST);
-        headers.remove(reqwest::header::CONTENT_LENGTH);
-        headers.remove(reqwest::header::ORIGIN);
-        headers.remove("sec-fetch-mode");
-        headers.remove("sec-fetch-site");
-        headers.remove("sec-fetch-dest");
+        let primary_request = task.primary_request();
+        let headers = build_request_headers(
+            &primary_request.normalized_headers(),
+            primary_request.cookies.as_deref(),
+            primary_request.user_agent.as_deref(),
+        );
 
         // 1. Fetch playlist content
-        let resp = client.get(&task.url).headers(headers.clone()).send().await?;
+        let resp = client
+            .get(&primary_request.url)
+            .headers(headers.clone())
+            .send()
+            .await?
+            .error_for_status()?;
         let playlist_text = resp.text().await?;
-        let base_url = Url::parse(&task.url)?;
+        if playlist_text.lines().any(|line| {
+            let line = line.trim().to_ascii_uppercase();
+            line.starts_with("#EXT-X-KEY:") && !line.contains("METHOD=NONE")
+        }) {
+            return Err(anyhow!("Encrypted HLS streams are not supported"));
+        }
+        let base_url = Url::parse(&primary_request.url)?;
 
         struct HlsVariant {
             bandwidth: u64,
@@ -659,8 +608,19 @@ impl StreamEngine {
             (init_chunk, segments, is_fmp4, total_duration)
         };
 
-        let v_resp = client.get(&video_playlist_url).headers(headers.clone()).send().await?;
+        let v_resp = client
+            .get(&video_playlist_url)
+            .headers(headers.clone())
+            .send()
+            .await?
+            .error_for_status()?;
         let v_text = v_resp.text().await?;
+        if v_text.lines().any(|line| {
+            let line = line.trim().to_ascii_uppercase();
+            line.starts_with("#EXT-X-KEY:") && !line.contains("METHOD=NONE")
+        }) {
+            return Err(anyhow!("Encrypted HLS streams are not supported"));
+        }
         let v_base = Url::parse(&video_playlist_url)?;
         let (v_init, v_segs, v_fmp4, v_duration) = parse_playlist(&v_text, &v_base);
 
@@ -685,8 +645,19 @@ impl StreamEngine {
 
         if let Some(audio_url) = maybe_audio_url {
             info!("HLS: downloading separated video and audio tracks...");
-            let a_resp = client.get(&audio_url).headers(headers.clone()).send().await?;
+            let a_resp = client
+                .get(&audio_url)
+                .headers(headers.clone())
+                .send()
+                .await?
+                .error_for_status()?;
             let a_text = a_resp.text().await?;
+            if a_text.lines().any(|line| {
+                let line = line.trim().to_ascii_uppercase();
+                line.starts_with("#EXT-X-KEY:") && !line.contains("METHOD=NONE")
+            }) {
+                return Err(anyhow!("Encrypted HLS streams are not supported"));
+            }
             let a_base = Url::parse(&audio_url)?;
             let (a_init, a_segs, a_fmp4, _a_duration) = parse_playlist(&a_text, &a_base);
 
@@ -710,7 +681,7 @@ impl StreamEngine {
                     if let Some((s, e)) = init_chunk.range {
                         req = req.header(RANGE, format!("bytes={}-{}", s, e));
                     }
-                    let init_b = req.send().await?.bytes().await?;
+                    let init_b = req.send().await?.error_for_status()?.bytes().await?;
                     v_file.write_all(&init_b).await?;
                     downloaded_bytes += init_b.len() as u64;
                 }
@@ -722,8 +693,8 @@ impl StreamEngine {
                     if let Some((start, end)) = s.range {
                         req = req.header(RANGE, format!("bytes={}-{}", start, end));
                     }
-                    if let Ok(mut r) = req.send().await {
-                        while let Some(chunk) = r.chunk().await? {
+                    let mut r = req.send().await?.error_for_status()?;
+                    while let Some(chunk) = r.chunk().await? {
                             v_file.write_all(&chunk).await?;
                             downloaded_bytes += chunk.len() as u64;
 
@@ -740,7 +711,6 @@ impl StreamEngine {
                                     t.speed = speed;
                                 }
                             }
-                        }
                     }
                 }
                 v_file.flush().await?;
@@ -759,7 +729,7 @@ impl StreamEngine {
                     if let Some((s, e)) = init_chunk.range {
                         req = req.header(RANGE, format!("bytes={}-{}", s, e));
                     }
-                    let init_b = req.send().await?.bytes().await?;
+                    let init_b = req.send().await?.error_for_status()?.bytes().await?;
                     a_file.write_all(&init_b).await?;
                     downloaded_bytes += init_b.len() as u64;
                 }
@@ -771,8 +741,8 @@ impl StreamEngine {
                     if let Some((start, end)) = s.range {
                         req = req.header(RANGE, format!("bytes={}-{}", start, end));
                     }
-                    if let Ok(mut r) = req.send().await {
-                        while let Some(chunk) = r.chunk().await? {
+                    let mut r = req.send().await?.error_for_status()?;
+                    while let Some(chunk) = r.chunk().await? {
                             a_file.write_all(&chunk).await?;
                             downloaded_bytes += chunk.len() as u64;
 
@@ -789,7 +759,6 @@ impl StreamEngine {
                                     t.speed = speed;
                                 }
                             }
-                        }
                     }
                 }
                 a_file.flush().await?;
@@ -812,18 +781,7 @@ impl StreamEngine {
             let status = cmd.output().await;
             let ok = status.as_ref().map(|s| s.status.success()).unwrap_or(false);
             if !ok {
-                // Retry clean stream copy fallback
-                let _ = Command::new("ffmpeg")
-                    .arg("-i")
-                    .arg(&temp_video)
-                    .arg("-i")
-                    .arg(&temp_audio)
-                    .arg("-c")
-                    .arg("copy")
-                    .arg("-y")
-                    .arg(&task.save_path)
-                    .output()
-                    .await;
+                return Err(anyhow!("HLS audio/video muxing failed"));
             }
 
             let _ = tokio::fs::remove_file(&temp_video).await;
@@ -852,7 +810,7 @@ impl StreamEngine {
                 if let Some((s, e)) = init_chunk.range {
                     req = req.header(RANGE, format!("bytes={}-{}", s, e));
                 }
-                let init_b = req.send().await?.bytes().await?;
+                let init_b = req.send().await?.error_for_status()?.bytes().await?;
                 out_file.write_all(&init_b).await?;
                 downloaded_bytes += init_b.len() as u64;
             }
@@ -868,8 +826,8 @@ impl StreamEngine {
                     req = req.header(RANGE, format!("bytes={}-{}", start, end));
                 }
 
-                if let Ok(mut r) = req.send().await {
-                    while let Some(chunk) = r.chunk().await? {
+                let mut r = req.send().await?.error_for_status()?;
+                while let Some(chunk) = r.chunk().await? {
                         out_file.write_all(&chunk).await?;
                         downloaded_bytes += chunk.len() as u64;
 
@@ -893,7 +851,6 @@ impl StreamEngine {
                                 }
                             }
                         }
-                    }
                 }
             }
 
@@ -973,43 +930,24 @@ impl StreamEngine {
             task.filename
         );
 
-        let mut headers = HeaderMap::new();
-        for (k, v) in &task.headers {
-            if let (Ok(name), Ok(val)) = (k.parse::<HeaderName>(), HeaderValue::from_str(v)) {
-                headers.insert(name, val);
-            }
-        }
-        if let Some(ref ua) = task.user_agent {
-            if let Ok(val) = HeaderValue::from_str(ua) {
-                headers.insert(reqwest::header::USER_AGENT, val);
-            }
-        }
-        let referer = task.headers.get("referer").or_else(|| task.headers.get("Referer"));
-        if let Some(ref_url) = referer {
-            if !ref_url.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(ref_url) {
-                    headers.insert(reqwest::header::REFERER, val);
-                }
-            }
-        }
-        if let Some(ref cookie_str) = task.cookies {
-            if !cookie_str.is_empty() {
-                if let Ok(val) = HeaderValue::from_str(cookie_str) {
-                    headers.insert(reqwest::header::COOKIE, val);
-                }
-            }
-        }
+        let primary_request = task.primary_request();
+        let headers = build_request_headers(
+            &primary_request.normalized_headers(),
+            primary_request.cookies.as_deref(),
+            primary_request.user_agent.as_deref(),
+        );
 
-        headers.remove(reqwest::header::HOST);
-        headers.remove(reqwest::header::CONTENT_LENGTH);
-        headers.remove(reqwest::header::ORIGIN);
-        headers.remove("sec-fetch-mode");
-        headers.remove("sec-fetch-site");
-        headers.remove("sec-fetch-dest");
-
-        let resp = client.get(&task.url).headers(headers.clone()).send().await?;
+        let resp = client
+            .get(&primary_request.url)
+            .headers(headers.clone())
+            .send()
+            .await?
+            .error_for_status()?;
         let manifest_text = resp.text().await?;
-        let base_url = Url::parse(&task.url)?;
+        if manifest_text.to_ascii_lowercase().contains("contentprotection") {
+            return Err(anyhow!("DRM-protected DASH streams are not supported"));
+        }
+        let base_url = Url::parse(&primary_request.url)?;
 
         // Parse MPD XML using quick-xml
         let mut reader = Reader::from_str(&manifest_text);
@@ -1463,7 +1401,7 @@ impl StreamEngine {
                 if let Some((s, e)) = init_chunk.range {
                     req = req.header(RANGE, format!("bytes={}-{}", s, e));
                 }
-                let b = req.send().await?.bytes().await?;
+                let b = req.send().await?.error_for_status()?.bytes().await?;
                 v_file.write_all(&b).await?;
                 downloaded_bytes += b.len() as u64;
             }
@@ -1476,8 +1414,8 @@ impl StreamEngine {
                 if let Some((start, end)) = seg.range {
                     req = req.header(RANGE, format!("bytes={}-{}", start, end));
                 }
-                if let Ok(mut r) = req.send().await {
-                    while let Some(chunk) = r.chunk().await? {
+                let mut r = req.send().await?.error_for_status()?;
+                while let Some(chunk) = r.chunk().await? {
                         v_file.write_all(&chunk).await?;
                         downloaded_bytes += chunk.len() as u64;
 
@@ -1501,7 +1439,6 @@ impl StreamEngine {
                                 }
                             }
                         }
-                    }
                 }
             }
             v_file.flush().await?;
@@ -1525,7 +1462,7 @@ impl StreamEngine {
                 if let Some((s, e)) = init_chunk.range {
                     req = req.header(RANGE, format!("bytes={}-{}", s, e));
                 }
-                let b = req.send().await?.bytes().await?;
+                let b = req.send().await?.error_for_status()?.bytes().await?;
                 a_file.write_all(&b).await?;
                 downloaded_bytes += b.len() as u64;
             }
@@ -1538,8 +1475,8 @@ impl StreamEngine {
                 if let Some((start, end)) = seg.range {
                     req = req.header(RANGE, format!("bytes={}-{}", start, end));
                 }
-                if let Ok(mut r) = req.send().await {
-                    while let Some(chunk) = r.chunk().await? {
+                let mut r = req.send().await?.error_for_status()?;
+                while let Some(chunk) = r.chunk().await? {
                         a_file.write_all(&chunk).await?;
                         downloaded_bytes += chunk.len() as u64;
 
@@ -1563,7 +1500,6 @@ impl StreamEngine {
                                 }
                             }
                         }
-                    }
                 }
             }
             a_file.flush().await?;
@@ -1637,16 +1573,7 @@ async fn download_single_track(
     progress_tx: tokio::sync::mpsc::Sender<(bool, u64, Option<u64>)>,
     is_video: bool,
 ) -> Result<u64> {
-    let mut clean_url = clean_stream_url(&url);
-    let is_googlevideo = clean_url.contains("googlevideo.com") || clean_url.contains("videoplayback");
-
-    // IDM Standard: Strip browser internal & routing headers that corrupt CDN routing
-    headers.remove(reqwest::header::HOST);
-    headers.remove(reqwest::header::CONTENT_LENGTH);
-    headers.remove(reqwest::header::ORIGIN);
-    headers.remove("sec-fetch-mode");
-    headers.remove("sec-fetch-site");
-    headers.remove("sec-fetch-dest");
+    let clean_url = url;
 
     // Check existing bytes for resumption (IDM-grade stream recovery)
     let existing_len = tokio::fs::metadata(&save_path)
@@ -1654,7 +1581,7 @@ async fn download_single_track(
         .map(|m| m.len())
         .unwrap_or(0);
 
-    // IDM Standard: Media streaming endpoints (like YouTube GVS CDN) STRICTLY require Range header!
+    // Range is generated independently; the captured URL itself is unchanged.
     let range_header = if existing_len > 0 {
         format!("bytes={}-", existing_len)
     } else {
@@ -1664,12 +1591,6 @@ async fn download_single_track(
         headers.insert(RANGE, range_val);
     }
 
-    if is_googlevideo && !headers.contains_key(reqwest::header::REFERER) {
-        if let Ok(val) = HeaderValue::from_str("https://www.youtube.com/") {
-            headers.insert(reqwest::header::REFERER, val);
-        }
-    }
-
     let mut resp = client
         .get(&clean_url)
         .headers(headers.clone())
@@ -1677,40 +1598,12 @@ async fn download_single_track(
         .await
         .map_err(|e| anyhow!("Stream HTTP request failed: {}", e))?;
 
-    let mut status = resp.status();
+    let status = resp.status();
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-        // If 403 on googlevideo, try IDM CDN fallback via 'mn' parameter (IDM VA 0x00567c91)
-        if status == reqwest::StatusCode::FORBIDDEN && is_googlevideo {
-            if let Ok(u) = Url::parse(&clean_url) {
-                let mn = u.query_pairs().find(|(k, _)| k == "mn").map(|(_, v)| v.to_string());
-                if let Some(mn_val) = mn {
-                    let servers: Vec<&str> = mn_val.split(',').collect();
-                    for srv in servers {
-                        let new_host = format!("{}.googlevideo.com", srv);
-                        if let Some(curr_h) = u.host_str() {
-                            if !curr_h.contains(srv) {
-                                let fb_url = clean_url.replace(curr_h, &new_host);
-                                info!("GVS 403 node fallback: retrying on {}", new_host);
-                                if let Ok(fb_resp) = client.get(&fb_url).headers(headers.clone()).send().await {
-                                    if fb_resp.status().is_success() || fb_resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                                        resp = fb_resp;
-                                        status = resp.status();
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-            return Err(anyhow!(
-                "Stream HTTP request returned error status: {}",
-                status
-            ));
-        }
+        return Err(anyhow!(
+            "Stream HTTP request returned error status: {}",
+            status
+        ));
     }
 
     let content_type = resp
@@ -1720,24 +1613,10 @@ async fn download_single_track(
         .unwrap_or("")
         .to_lowercase();
 
-    // If YouTube UMP protocol format returned, retry without ump=1 query parameter if safe
+    // UMP is not a directly playable container.  Do not mutate the signed
+    // request to guess a different representation.
     if content_type.contains("application/vnd.yt-ump") {
-        if clean_url.contains("ump=1") {
-            clean_url = strip_query_param(&clean_url, "ump");
-            info!("Retrying without ump parameter to receive raw media container");
-            resp = client
-                .get(&clean_url)
-                .headers(headers.clone())
-                .send()
-                .await
-                .map_err(|e| anyhow!("Stream HTTP request retry failed: {}", e))?;
-            status = resp.status();
-            if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
-                return Err(anyhow!("Stream request returned UMP protocol error"));
-            }
-        } else {
-            return Err(anyhow!("Stream request returned UMP protocol error"));
-        }
+        return Err(anyhow!("Captured stream returned unsupported UMP data"));
     }
 
     let is_resume_ok = existing_len > 0 && status == reqwest::StatusCode::PARTIAL_CONTENT;
@@ -1750,12 +1629,7 @@ async fn download_single_track(
             Some(cl)
         }
     } else {
-        // Fallback to clen from URL if Content-Length header is omitted by CDN
-        Url::parse(&clean_url).ok().and_then(|u| {
-            u.query_pairs()
-                .find(|(k, _)| k.eq_ignore_ascii_case("clen") || k.eq_ignore_ascii_case("filesize"))
-                .and_then(|(_, v)| v.parse::<u64>().ok())
-        })
+        None
     };
     let _ = progress_tx.send((is_video, downloaded, total_len)).await;
 
@@ -1847,13 +1721,42 @@ mod tests {
         let rel = "init.mp4";
         assert_eq!(
             resolve_url_preserving_query(&base, rel),
-            "https://video.twimg.com/ext/init.mp4?tag=12"
+            "https://video.twimg.com/ext/init.mp4"
         );
 
         let with_own_query = "chunk.m4s?foo=bar";
         assert_eq!(
             resolve_url_preserving_query(&base, with_own_query),
             "https://video.twimg.com/ext/chunk.m4s?foo=bar"
+        );
+    }
+
+    #[test]
+    fn captured_candidate_kind_overrides_url_heuristics() {
+        use crate::{MediaCandidate, MediaCandidateKind, RequestContext};
+
+        let mut task = DownloadTask::from_media_candidate(
+            MediaCandidate {
+                id: Some("fixture".to_string()),
+                kind: MediaCandidateKind::HlsManifest,
+                page_url: None,
+                primary: RequestContext {
+                    // A signed manifest need not end with .m3u8.
+                    url: "https://cdn.example.invalid/play?token=signed".to_string(),
+                    ..RequestContext::default()
+                },
+                audio: None,
+                quality: None,
+                codecs: None,
+                unsupported_reason: None,
+            },
+            "fixture.mp4".to_string(),
+            PathBuf::from("/tmp/fixture.mp4"),
+        );
+        task.url = "https://cdn.example.invalid/play?token=signed".to_string();
+        assert_eq!(
+            StreamEngine::classify_task(&task),
+            StreamDispatchMode::HlsSegmented
         );
     }
 }
