@@ -207,24 +207,18 @@ async function handleMediaResponse(tabId, details) {
   const cleanUrl = url.split("?")[0].toLowerCase();
   const isYouTubePlayback = url.includes("googlevideo.com/videoplayback") || url.includes("/videoplayback");
 
-  let targetDownloadUrl = url;
-  try {
-    const u = new URL(url);
-    u.searchParams.delete("bytestart");
-    u.searchParams.delete("byteend");
-    u.searchParams.delete("range");
-    u.searchParams.delete("rn");
-    u.searchParams.delete("alr");
-    u.searchParams.delete("sq");
-    u.searchParams.delete("segment");
-    u.searchParams.delete("frag");
-    u.searchParams.delete("sabr");
-    u.searchParams.delete("rqh");
-    u.searchParams.delete("ump");
-    u.searchParams.delete("len");
-    u.searchParams.delete("begin");
-    targetDownloadUrl = u.toString();
-  } catch (_) {}
+  // IDM Architecture: Retain exact RAW URL without JS query parameter alteration
+  // (Prevents HMAC signature destruction on Pinterest, YouTube, Twitter)
+  const targetDownloadUrl = url;
+
+  // Filter out internal chunk segments: .m4s and .ts should NOT be treated as independent top-level videos!
+  const isFragment = cleanUrl.endsWith(".m4s") || cleanUrl.endsWith(".ts");
+  const isPlaylist = cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mpd") || contentType.includes("mpegurl") || contentType.includes("dash");
+
+  if (isFragment) {
+    // IDM Standard: Never expose internal child segments (.m4s, .ts) as separate downloads to the user
+    return;
+  }
 
   const isMediaMime =
     contentType.startsWith("video/") ||
@@ -236,26 +230,31 @@ async function handleMediaResponse(tabId, details) {
 
   const isMediaExt =
     cleanUrl.endsWith(".mp4") ||
-    cleanUrl.endsWith(".m4s") ||
     cleanUrl.endsWith(".webm") ||
     cleanUrl.endsWith(".mkv") ||
     cleanUrl.endsWith(".flv") ||
     cleanUrl.endsWith(".m3u8") ||
     cleanUrl.endsWith(".mpd") ||
-    cleanUrl.endsWith(".ts") ||
     cleanUrl.endsWith(".mov") ||
     cleanUrl.endsWith(".mp3") ||
     cleanUrl.endsWith(".m4a") ||
     cleanUrl.endsWith(".aac") ||
     cleanUrl.endsWith(".wav");
 
-  const isPlaylist = cleanUrl.endsWith(".m3u8") || cleanUrl.endsWith(".mpd") || contentType.includes("mpegurl") || contentType.includes("dash");
   if (!isYouTubePlayback && !isPlaylist && contentLength > 0 && contentLength < 100 * 1024) {
     return;
   }
 
   if (isYouTubePlayback || isMediaMime || isMediaExt) {
-    const streams = await getTabStreams(tabId);
+    let streams = await getTabStreams(tabId);
+    if (isPlaylist) {
+      // Prioritize master playlist and purge any child fragments
+      streams = streams.filter((s) => {
+        const c = s.url.split("?")[0].toLowerCase();
+        return !c.endsWith(".m4s") && !c.endsWith(".ts");
+      });
+    }
+
     if (!streams.some((s) => s.url === targetDownloadUrl)) {
       const quality = inferQuality(url, contentType, contentLength);
       const item = {
@@ -265,7 +264,11 @@ async function handleMediaResponse(tabId, details) {
         quality: quality,
         timestamp: Date.now()
       };
-      streams.push(item);
+      if (isPlaylist) {
+        streams.unshift(item); // Master playlist takes top spot
+      } else {
+        streams.push(item);
+      }
       await saveTabStreams(tabId, streams);
 
       // Notify Top Frame Floating Bar
@@ -417,16 +420,46 @@ async function sendToIllusion(details) {
     let cookiesStr = "";
     try {
       const urlObj = new URL(details.url);
-      let targetDomain = urlObj.hostname;
+      const mediaDomain = urlObj.hostname;
+      let refDomain = "";
       if (details.referer) {
-        try { targetDomain = new URL(details.referer).hostname; } catch (_) {}
+        try { refDomain = new URL(details.referer).hostname; } catch (_) {}
       }
-      if (targetDomain.includes("googlevideo.com")) {
-        targetDomain = "youtube.com";
+
+      const cookieMap = new Map();
+      // 1. Get all cookies (including HttpOnly) for page/referer URL
+      if (details.referer) {
+        try {
+          const cList = await chrome.cookies.getAll({ url: details.referer });
+          if (cList) {
+            for (const c of cList) cookieMap.set(c.name, c.value);
+          }
+        } catch (_) {}
+        // Also query domain-level cookies (.youtube.com, etc.)
+        try {
+          const refHost = new URL(details.referer).hostname;
+          const refParts = refHost.split(".");
+          const refRoot = refParts.length >= 2 ? refParts.slice(-2).join(".") : refHost;
+          const cList1 = await chrome.cookies.getAll({ domain: "." + refRoot });
+          if (cList1) {
+            for (const c of cList1) cookieMap.set(c.name, c.value);
+          }
+          const cList2 = await chrome.cookies.getAll({ domain: refRoot });
+          if (cList2) {
+            for (const c of cList2) cookieMap.set(c.name, c.value);
+          }
+        } catch (_) {}
       }
-      const rootDomain = targetDomain.split(".").slice(-2).join(".");
-      const cookies = await chrome.cookies.getAll({ domain: rootDomain });
-      cookiesStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+      // 2. Get cookies for media URL (e.g. googlevideo.com)
+      if (details.url) {
+        try {
+          const cList = await chrome.cookies.getAll({ url: details.url });
+          if (cList) {
+            for (const c of cList) cookieMap.set(c.name, c.value);
+          }
+        } catch (_) {}
+      }
+      cookiesStr = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
     } catch (_) {}
 
     // Merge cached ring buffer headers if present

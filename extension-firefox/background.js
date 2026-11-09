@@ -434,17 +434,37 @@ async function sendToIllusion(details) {
   try {
     let cookiesStr = "";
     try {
-      const urlObj = new URL(details.url);
-      let targetDomain = urlObj.hostname;
+      const cookieMap = new Map();
       if (details.referer) {
-        try { targetDomain = new URL(details.referer).hostname; } catch (_) {}
+        try {
+          const cList = await chrome.cookies.getAll({ url: details.referer });
+          if (cList) {
+            for (const c of cList) cookieMap.set(c.name, c.value);
+          }
+        } catch (_) {}
+        try {
+          const refHost = new URL(details.referer).hostname;
+          const refParts = refHost.split(".");
+          const refRoot = refParts.length >= 2 ? refParts.slice(-2).join(".") : refHost;
+          const cList1 = await chrome.cookies.getAll({ domain: "." + refRoot });
+          if (cList1) {
+            for (const c of cList1) cookieMap.set(c.name, c.value);
+          }
+          const cList2 = await chrome.cookies.getAll({ domain: refRoot });
+          if (cList2) {
+            for (const c of cList2) cookieMap.set(c.name, c.value);
+          }
+        } catch (_) {}
       }
-      if (targetDomain.includes("googlevideo.com")) {
-        targetDomain = "youtube.com";
+      if (details.url) {
+        try {
+          const cList = await chrome.cookies.getAll({ url: details.url });
+          if (cList) {
+            for (const c of cList) cookieMap.set(c.name, c.value);
+          }
+        } catch (_) {}
       }
-      const rootDomain = targetDomain.split(".").slice(-2).join(".");
-      const cookies = await chrome.cookies.getAll({ domain: rootDomain });
-      cookiesStr = cookies.map((c) => `${c.name}=${c.value}`).join("; ");
+      cookiesStr = Array.from(cookieMap.entries()).map(([k, v]) => `${k}=${v}`).join("; ");
     } catch (_) {}
 
     // Merge cached ring buffer headers if present

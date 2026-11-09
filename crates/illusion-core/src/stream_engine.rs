@@ -67,13 +67,7 @@ pub fn clean_stream_url(raw_url: &str) -> String {
 
         let mut url = raw_url.to_string();
 
-        // 1. Convert sig to signature if signature is not already present (IDM VA 0x00427af1)
-        if (url.contains("?sig=") || url.contains("&sig=")) && !url.contains("signature=") {
-            url = url.replace("?sig=", "?signature=");
-            url = url.replace("&sig=", "&signature=");
-        }
-
-        // 2. Strip non-signed range and slicing params (IDM VA 0x004277c0)
+        // 1. Strip non-signed range and slicing params (IDM VA 0x004277c0)
         let strip_candidates = ["range", "begin", "ump", "len", "sq", "segment", "frag", "sabr", "rqh"];
         for param in strip_candidates {
             if !sparams_list.contains(&param) {
@@ -131,6 +125,10 @@ impl StreamEngine {
             task.filename
         );
 
+        if let Some(parent) = task.save_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+
         let video_part = task.save_path.with_extension("video_part.mp4");
         let audio_part = task.save_path.with_extension("audio_part.m4a");
 
@@ -146,6 +144,35 @@ impl StreamEngine {
                 headers.insert(reqwest::header::USER_AGENT, val);
             }
         }
+        if !headers.contains_key(reqwest::header::USER_AGENT) {
+            headers.insert(
+                reqwest::header::USER_AGENT,
+                HeaderValue::from_static("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+            );
+        }
+        let referer = task.headers.get("referer").or_else(|| task.headers.get("Referer"));
+        if let Some(ref_url) = referer {
+            if !ref_url.is_empty() {
+                if let Ok(val) = HeaderValue::from_str(ref_url) {
+                    headers.insert(reqwest::header::REFERER, val);
+                }
+            }
+        }
+        if let Some(ref cookie_str) = task.cookies {
+            if !cookie_str.is_empty() {
+                if let Ok(val) = HeaderValue::from_str(cookie_str) {
+                    headers.insert(reqwest::header::COOKIE, val);
+                }
+            }
+        }
+
+        // IDM Standard: Strip browser internal headers that interfere with CDN token routing
+        headers.remove(reqwest::header::HOST);
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        headers.remove(reqwest::header::ORIGIN);
+        headers.remove("sec-fetch-mode");
+        headers.remove("sec-fetch-site");
+        headers.remove("sec-fetch-dest");
         if let Some(ref cookies) = task.cookies {
             if !cookies.is_empty() {
                 if let Ok(val) = HeaderValue::from_str(cookies) {
@@ -307,6 +334,29 @@ impl StreamEngine {
                 headers.insert(reqwest::header::USER_AGENT, val);
             }
         }
+        let referer = task.headers.get("referer").or_else(|| task.headers.get("Referer"));
+        if let Some(ref_url) = referer {
+            if !ref_url.is_empty() {
+                if let Ok(val) = HeaderValue::from_str(ref_url) {
+                    headers.insert(reqwest::header::REFERER, val);
+                }
+            }
+        }
+        if let Some(ref cookie_str) = task.cookies {
+            if !cookie_str.is_empty() {
+                if let Ok(val) = HeaderValue::from_str(cookie_str) {
+                    headers.insert(reqwest::header::COOKIE, val);
+                }
+            }
+        }
+
+        // IDM Standard: Strip browser internal headers that interfere with CDN token routing
+        headers.remove(reqwest::header::HOST);
+        headers.remove(reqwest::header::CONTENT_LENGTH);
+        headers.remove(reqwest::header::ORIGIN);
+        headers.remove("sec-fetch-mode");
+        headers.remove("sec-fetch-site");
+        headers.remove("sec-fetch-dest");
 
         // 1. Fetch playlist content
         let resp = client.get(&task.url).headers(headers.clone()).send().await?;

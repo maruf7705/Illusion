@@ -1,0 +1,51 @@
+{
+  "id": "ev_b03f054c161cb53287f0c291a0d4d15762cb5884e3d874412adea044b1ead641",
+  "subject": {
+    "kind": "unknown",
+    "sha256": "80c3fe2ae1062abf56456f52518bd670f9ec3917b7f85e152b347ac6b6faf880",
+    "name": "IDM_installer.exe"
+  },
+  "operation": "core_target_triage",
+  "params": {
+    "path": "/home/sadi/.gemini/antigravity/scratch/IDM_installer.exe"
+  },
+  "result": {
+    "description": "A file we don't recognise yet",
+    "kind": "unknown",
+    "next_steps": [
+      {
+        "tool": "native_bytes_show",
+        "why": "look at the raw bytes"
+      },
+      {
+        "tool": "core_target_open",
+        "why": "reopen with format=raw-binary if it is machine code"
+      }
+    ],
+    "plain_english": "IDM_installer.exe isn't a format we recognise yet.",
+    "recommended_toolsets": [
+      "core"
+    ],
+    "size": 196
+  },
+  "summary": "IDM_installer.exe isn't a format we recognise yet.",
+  "confidence": "inferred",
+  "authority": "original-files",
+  "environment": {
+    "clean_room": false,
+    "engine": "builtin",
+    "engine_version": "0.5.0",
+    "host": "linux-x86_64"
+  },
+  "limitations": [
+    {
+      "code": "detected_by_content",
+      "message": "the kind is detected from the first bytes and, to break ties, the file name"
+    }
+  ],
+  "coverage": {
+    "status": "unknown"
+  },
+  "locations": [],
+  "links": []
+}

@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "name": "IDM_installer",
+  "request": "I want to assign a task to another AI agent.\n\nThe agent should investigate and analyze the following:\n\n1. **IDM Download Engine:** Identify and analyze the core download engine used by Internet Download Manager (IDM).\n\n2. **Download Technologies:** Investigate how IDM downloads content using its native HLS, fMP4, and DASH network sniffers, along with any other download mechanisms or technologies it uses.\n\n3. **Browser Extension Integration:** Analyze how IDM establishes and maintains connections with its Firefox and Chrome extensions.\n\n4. **In-Browser Toolbar:** Investigate how IDM's in-browser toolbar is integrated, managed, and maintained within the browser.",
+  "target": {
+    "kind": "local",
+    "path": "/home/sadi/.gemini/antigravity/scratch/IDM_installer.exe"
+  },
+  "stack": "Rust + egui (eframe)",
+  "status": "stopped",
+  "note": "Paused. Send a message to continue.",
+  "created_ms": 1794197248463,
+  "updated_ms": 1794197269668,
+  "checks": [],
+  "agent_session": null,
+  "agent_session_by": "hermes",
+  "allowed_actions": [],
+  "last_reply": "",
+  "asset_budget_usd": 5.0,
+  "generate_assets": false
+}

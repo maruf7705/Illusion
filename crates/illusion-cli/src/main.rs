@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
             }
             let url = args[2].clone();
             let mut filename = String::new();
+            let mut audio_url: Option<String> = None;
             let mut custom_dir: Option<PathBuf> = None;
             let mut conns = 8;
 
@@ -34,6 +35,12 @@ async fn main() -> Result<()> {
                     "--filename" | "-f" => {
                         if i + 1 < args.len() {
                             filename = args[i + 1].clone();
+                            i += 1;
+                        }
+                    }
+                    "--audio-url" | "-a" => {
+                        if i + 1 < args.len() {
+                            audio_url = Some(args[i + 1].clone());
                             i += 1;
                         }
                     }
@@ -62,7 +69,7 @@ async fn main() -> Result<()> {
             let save_dir = custom_dir.unwrap_or_else(|| state.default_download_dir.clone());
             let save_path = save_dir.join(&filename);
 
-            let task = DownloadTask::new(
+            let mut task = DownloadTask::new(
                 url.clone(),
                 filename.clone(),
                 save_path.clone(),
@@ -71,6 +78,7 @@ async fn main() -> Result<()> {
                 None,
                 Some("Illusion/0.1.0".to_string()),
             );
+            task.audio_url = audio_url;
 
             let task_id = task.id.clone();
             state.add_task(task).await;

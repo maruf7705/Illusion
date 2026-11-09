@@ -734,12 +734,22 @@
     const ext = stream.mime && stream.mime.includes("audio") ? ".m4a" : ".mp4";
     const filename = title.replace(/[^a-zA-Z0-9_\-\. ]/g, "_").trim() + ext;
 
+    // Guarantee audio track pairing for YouTube adaptive streams (IDM parity)
+    let effectiveAudioUrl = stream.audioUrl || null;
+    const isVideo = !stream.mime || !stream.mime.includes("audio");
+    if (!effectiveAudioUrl && isVideo && (stream.url.includes("googlevideo.com") || window.location.hostname.includes("youtube.com"))) {
+      const audioMatch = currentStreams.find(s => (s.mime && s.mime.includes("audio")) || ["140", "251", "250", "249"].includes(s.itag));
+      if (audioMatch && audioMatch.url && audioMatch.url !== stream.url) {
+        effectiveAudioUrl = audioMatch.url;
+      }
+    }
+
     const payload = {
       action: "add_download",
       url: stream.url,
       filename: filename,
       referer: window.location.href,
-      audio_url: stream.audioUrl || null,
+      audio_url: effectiveAudioUrl,
       quality: stream.quality || "",
       headers: {
         Referer: window.location.href,
@@ -757,7 +767,7 @@
             type: "START_VIDEO_DOWNLOAD",
             url: stream.url,
             filename: filename,
-            audio_url: stream.audioUrl || null,
+            audio_url: effectiveAudioUrl,
             page_url: window.location.href,
             quality: stream.quality || ""
           }, (response) => {

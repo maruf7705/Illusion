@@ -130,60 +130,57 @@ pub async fn probe_url(
         }
     }
 
-    // If HEAD failed or gave no content-length, and total_size is still unknown, probe with Range GET bytes=0-0
-    // (If total_size is already known via clen or HEAD, skip GET bytes=0-0 to avoid 403 Forbidden from CDNs)
+    // If HEAD failed or gave no content-length, and total_size is still unknown, probe with Range GET bytes=0-
+    // (IDM Standard 0x00567c91: Always send "bytes=0-" rather than "bytes=0-0")
     if total_size.is_none() {
         let mut probe_headers = custom_headers.clone();
-        probe_headers.insert(RANGE, HeaderValue::from_static("bytes=0-0"));
+        probe_headers.insert(RANGE, HeaderValue::from_static("bytes=0-"));
 
-        let get_resp = client.get(&clean_url).headers(probe_headers).send().await?;
-        let status = get_resp.status();
-        let headers = get_resp.headers();
+        let get_resp = client.get(&clean_url).headers(probe_headers).send().await;
+        if let Ok(resp) = get_resp {
+            let status = resp.status();
+            let headers = resp.headers();
 
-        if !status.is_success() && status.as_u16() != 206 {
-            if status.as_u16() == 403 && is_googlevideo {
-                // Google Video CDN returns 403 Forbidden on bytes=0-0 if tokens are strict;
-                // Treat as streamable with ranges enabled
-                accept_ranges = true;
-            } else {
-                return Err(anyhow::anyhow!("Remote server returned HTTP status {}", status));
-            }
-        } else if status.as_u16() == 206 {
-            accept_ranges = true;
-            // Parse Content-Range: bytes 0-0/123456
-            if let Some(cr) = headers.get("content-range") {
-                if let Ok(val) = cr.to_str() {
-                    if let Some(pos) = val.rfind('/') {
-                        let total_part = &val[pos + 1..].trim();
-                        if let Ok(s) = total_part.parse::<u64>() {
-                            total_size = Some(s);
+            if status.is_success() || status.as_u16() == 206 {
+                if status.as_u16() == 206 {
+                    accept_ranges = true;
+                }
+                // Parse Content-Range: bytes 0-XXXXX/123456
+                if let Some(cr) = headers.get("content-range") {
+                    if let Ok(val) = cr.to_str() {
+                        if let Some(pos) = val.rfind('/') {
+                            let total_part = &val[pos + 1..].trim();
+                            if let Ok(s) = total_part.parse::<u64>() {
+                                total_size = Some(s);
+                            }
                         }
                     }
                 }
-            }
-        } else if status.is_success() {
-            // Server ignored Range header, sends entire body
-            accept_ranges = false;
-            if let Some(cl) = headers.get(CONTENT_LENGTH) {
-                if let Ok(val) = cl.to_str() {
-                    total_size = val.trim().parse::<u64>().ok();
+                if total_size.is_none() {
+                    if let Some(cl) = headers.get(CONTENT_LENGTH) {
+                        if let Ok(val) = cl.to_str() {
+                            total_size = val.trim().parse::<u64>().ok();
+                        }
+                    }
                 }
-            }
-        }
-
-        if disposition_filename.is_none() {
-            if let Some(cd) = headers.get(CONTENT_DISPOSITION) {
-                if let Ok(val) = cd.to_str() {
-                    disposition_filename = parse_content_disposition_filename(val);
+                if disposition_filename.is_none() {
+                    if let Some(cd) = headers.get(CONTENT_DISPOSITION) {
+                        if let Ok(val) = cd.to_str() {
+                            disposition_filename = parse_content_disposition_filename(val);
+                        }
+                    }
                 }
-            }
-        }
-
-        if content_type.is_none() {
-            if let Some(ct) = headers.get(CONTENT_TYPE) {
-                if let Ok(val) = ct.to_str() {
-                    content_type = Some(val.to_string());
+                if content_type.is_none() {
+                    if let Some(ct) = headers.get(CONTENT_TYPE) {
+                        if let Ok(val) = ct.to_str() {
+                            content_type = Some(val.to_string());
+                        }
+                    }
                 }
+            } else if status.as_u16() == 403 {
+                // Streaming CDNs (e.g. YouTube, Pinterest, Twitter) may disallow raw probe GETs;
+                // allow stream engine to proceed with direct single-stream GET
+                accept_ranges = true;
             }
         }
     }

@@ -111,9 +111,13 @@ pub struct DownloadTask {
     pub segments: Vec<Segment>,
     pub category: DownloadCategory,
     pub headers: HashMap<String, String>,
+    #[serde(default)]
     pub cookies: Option<String>,
+    #[serde(default)]
     pub user_agent: Option<String>,
+    #[serde(default)]
     pub audio_url: Option<String>,
+    #[serde(default)]
     pub quality: Option<String>,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
