@@ -56,6 +56,18 @@
     };
 
     safeSendMessage(payload);
+
+    if (src && !src.startsWith("blob:") && !src.startsWith("data:") && src.startsWith("http")) {
+      safeSendMessage({
+        type: "ILLUSION_STREAM_DISCOVERED",
+        stream: {
+          url: src,
+          quality: el.videoHeight ? `${el.videoHeight}p` : "Video Stream",
+          mime: src.includes(".m3u8") ? "application/vnd.apple.mpegurl" : (el.tagName.toLowerCase() === "audio" ? "audio/mp4" : "video/mp4"),
+          size: 0
+        }
+      });
+    }
   }
 
   // 1. Scan DOM for Media Elements

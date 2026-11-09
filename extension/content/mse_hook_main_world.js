@@ -9,9 +9,19 @@
   const blobMediaMap = new Map();
   const capturedCodecs = [];
 
-  // IDM Standard: Pass raw URL intact to backend without URL re-encoding (which corrupts GoogleVideo HMAC)
   function cleanUrl(url) {
     if (!url || typeof url !== "string") return "";
+    try {
+      const u = new URL(url);
+      const sparams = (u.searchParams.get("sparams") || "").split(",");
+      // CRITICAL: Never strip parameters that are signed by Google Video sparams HMAC!
+      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag", "sabr", "rqh", "ump", "len", "begin"].forEach((p) => {
+        if (!sparams.includes(p)) {
+          u.searchParams.delete(p);
+        }
+      });
+      return u.toString();
+    } catch (_) {}
     return url;
   }
 
@@ -43,11 +53,8 @@
       const u = new URL(url);
       if (u.pathname.includes("videoplayback") || u.hostname.includes("googlevideo.com")) {
         const itag = u.searchParams.get("itag");
-        const isSabr = u.searchParams.has("sabr") || u.searchParams.has("ump");
         const cleaned = cleanUrl(url);
-
-        // IDM Standard: Never emit SABR/UMP chunk URLs as downloadable media (causes sabr.malformed_config)
-        if (!isSabr && itag) {
+        if (itag) {
           liveItagUrls.set(itag, cleaned);
           const isAudio = ["140", "251", "250", "249"].includes(itag);
           if (isAudio) {
@@ -82,7 +89,6 @@
           }
         }
         lastActivePlaybackUrl = cleaned;
-        inspectGlobalPlayerState(cleaned);
       }
     } catch (_) {}
   }
@@ -92,8 +98,22 @@
     const cleaned = cleanUrl(detail.url);
 
     let quality = detail.quality || "";
-    let mime = detail.mime || "video/mp4";
+    let mime = detail.mime || "";
     let size = detail.size || 0;
+
+    if (!mime) {
+      if (cleaned.includes(".m3u8")) mime = "application/vnd.apple.mpegurl";
+      else if (cleaned.includes(".mpd")) mime = "application/dash+xml";
+      else if (cleaned.includes(".webm")) mime = "video/webm";
+      else if (cleaned.includes(".mp3")) mime = "audio/mpeg";
+      else if (cleaned.includes(".m4a")) mime = "audio/mp4";
+      else mime = "video/mp4";
+    }
+
+    if (!quality) {
+      if (cleaned.includes(".m3u8")) quality = "HLS Stream (.m3u8)";
+      else if (cleaned.includes(".mpd")) quality = "DASH Stream (.mpd)";
+    }
 
     try {
       const u = new URL(cleaned);
@@ -175,27 +195,12 @@
 
   function extractFormatUrl(f) {
     if (!f) return null;
-    if (f.url && typeof f.url === "string") return f.url;
-    if (f.signatureCipher || f.cipher) {
-      try {
-        const cipher = f.signatureCipher || f.cipher;
-        const params = new URLSearchParams(cipher);
-        const url = params.get("url");
-        const sig = params.get("s");
-        const sp = params.get("sp") || "sig";
-        if (url && sig) {
-          return `${url}&${sp}=${sig}`;
-        }
-        if (url) return url;
-      } catch (_) {}
-    }
-    // Check if we intercepted a clean non-SABR stream URL
+    if (f.url) return f.url;
+    // Check if we already intercepted the live deciphered URL for this itag from network playback
     if (f.itag && liveItagUrls.has(f.itag.toString())) {
-      const u = liveItagUrls.get(f.itag.toString());
-      if (u && !u.includes("sabr=1") && !u.includes("ump=1")) {
-        return u;
-      }
+      return liveItagUrls.get(f.itag.toString());
     }
+    // Never emit fake undeciphered URLs with raw cipher signatures (triggers 403 Forbidden)
     return null;
   }
 
@@ -204,24 +209,23 @@
     const formats = streaming.formats || [];
     const adaptive = streaming.adaptiveFormats || [];
 
-    // Find best audio URL from clean formats
-    let bestAudioUrl = null;
-    for (const fmt of adaptive) {
-      if (fmt.mimeType && fmt.mimeType.includes("audio")) {
-        const u = extractFormatUrl(fmt);
-        if (u) {
-          bestAudioUrl = cleanUrl(u);
-          break;
+    // Find best audio URL
+    let bestAudioUrl = lastActiveAudioUrl || liveItagUrls.get("140") || liveItagUrls.get("251");
+    if (!bestAudioUrl) {
+      for (const fmt of adaptive) {
+        if (fmt.mimeType && fmt.mimeType.includes("audio")) {
+          const u = liveItagUrls.get(fmt.itag?.toString()) || extractFormatUrl(fmt);
+          if (u) {
+            bestAudioUrl = cleanUrl(u);
+            break;
+          }
         }
       }
-    }
-    if (!bestAudioUrl && lastActiveAudioUrl && !lastActiveAudioUrl.includes("sabr=1")) {
-      bestAudioUrl = lastActiveAudioUrl;
     }
 
     // 1. Process regular muxed formats
     formats.forEach((f) => {
-      let streamUrl = extractFormatUrl(f);
+      let streamUrl = liveItagUrls.get(f.itag?.toString()) || extractFormatUrl(f);
       if (streamUrl) {
         emitMediaDiscovery({
           url: cleanUrl(streamUrl),
@@ -236,7 +240,16 @@
     // 2. Process adaptive video & audio formats
     adaptive.forEach((f) => {
       const isAudio = f.mimeType && f.mimeType.includes("audio");
-      let streamUrl = extractFormatUrl(f);
+      let streamUrl = liveItagUrls.get(f.itag?.toString()) || extractFormatUrl(f);
+      if (!streamUrl && activeUrl) {
+        try {
+          const u = new URL(activeUrl);
+          if (u.searchParams.get("itag") === f.itag?.toString()) {
+            streamUrl = cleanUrl(activeUrl);
+          }
+        } catch (_) {}
+      }
+
       if (streamUrl) {
         const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
         emitMediaDiscovery({
@@ -245,9 +258,6 @@
           mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
           size: parseInt(f.contentLength || "0", 10) || 0,
           audioUrl: isAudio ? null : bestAudioUrl
-        });
-      }
-    });
         });
       }
     });

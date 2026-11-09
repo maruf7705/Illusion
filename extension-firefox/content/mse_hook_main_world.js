@@ -15,7 +15,7 @@
       const u = new URL(url);
       const sparams = (u.searchParams.get("sparams") || "").split(",");
       // CRITICAL: Never strip parameters that are signed by Google Video sparams HMAC!
-      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag"].forEach((p) => {
+      ["bytestart", "byteend", "range", "rn", "alr", "sq", "segment", "frag", "sabr", "rqh", "ump", "len", "begin"].forEach((p) => {
         if (!sparams.includes(p)) {
           u.searchParams.delete(p);
         }
@@ -98,8 +98,22 @@
     const cleaned = cleanUrl(detail.url);
 
     let quality = detail.quality || "";
-    let mime = detail.mime || "video/mp4";
+    let mime = detail.mime || "";
     let size = detail.size || 0;
+
+    if (!mime) {
+      if (cleaned.includes(".m3u8")) mime = "application/vnd.apple.mpegurl";
+      else if (cleaned.includes(".mpd")) mime = "application/dash+xml";
+      else if (cleaned.includes(".webm")) mime = "video/webm";
+      else if (cleaned.includes(".mp3")) mime = "audio/mpeg";
+      else if (cleaned.includes(".m4a")) mime = "audio/mp4";
+      else mime = "video/mp4";
+    }
+
+    if (!quality) {
+      if (cleaned.includes(".m3u8")) quality = "HLS Stream (.m3u8)";
+      else if (cleaned.includes(".mpd")) quality = "DASH Stream (.mpd)";
+    }
 
     try {
       const u = new URL(cleaned);

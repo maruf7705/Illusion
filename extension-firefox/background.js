@@ -218,6 +218,11 @@ async function handleMediaResponse(tabId, details) {
     u.searchParams.delete("sq");
     u.searchParams.delete("segment");
     u.searchParams.delete("frag");
+    u.searchParams.delete("sabr");
+    u.searchParams.delete("rqh");
+    u.searchParams.delete("ump");
+    u.searchParams.delete("len");
+    u.searchParams.delete("begin");
     targetDownloadUrl = u.toString();
   } catch (_) {}
 
@@ -256,10 +261,10 @@ async function handleMediaResponse(tabId, details) {
 
     const existingIdx = streams.findIndex((s) => {
       if (s.url === targetDownloadUrl) return true;
-      const sIsAudio = (s.mime || "").includes("audio") || (s.quality || "").toLowerCase().includes("audio");
-      if (sIsAudio === isAudio && s.quality && quality && s.quality.toLowerCase() === quality.toLowerCase()) {
-        return true;
-      }
+      let itag1 = null, itag2 = null;
+      try { itag1 = new URL(s.url).searchParams.get("itag"); } catch(_) {}
+      try { itag2 = new URL(targetDownloadUrl).searchParams.get("itag"); } catch(_) {}
+      if (itag1 && itag2 && itag1 === itag2) return true;
       return false;
     });
 

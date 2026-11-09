@@ -15,6 +15,204 @@
   let currentStreams = [];
   let hideTimer = null;
   let targetVideoRect = null;
+  let pollInterval = null;
+
+  function cleanMediaUrl(url) {
+    if (!url || typeof url !== "string") return "";
+    try {
+      const u = new URL(url);
+      u.searchParams.delete("bytestart");
+      u.searchParams.delete("byteend");
+      u.searchParams.delete("range");
+      u.searchParams.delete("rn");
+      u.searchParams.delete("alr");
+      u.searchParams.delete("sq");
+      u.searchParams.delete("segment");
+      u.searchParams.delete("frag");
+      u.searchParams.delete("sabr");
+      u.searchParams.delete("rqh");
+      u.searchParams.delete("ump");
+      u.searchParams.delete("len");
+      u.searchParams.delete("begin");
+      return u.toString();
+    } catch (_) {
+      return url;
+    }
+  }
+
+  function addStream(stream) {
+    if (!stream || !stream.url) return;
+    const url = cleanMediaUrl(stream.url);
+    stream.url = url;
+    if (stream.audioUrl) {
+      stream.audioUrl = cleanMediaUrl(stream.audioUrl);
+    }
+
+    let itag = stream.itag || null;
+    if (!itag) {
+      try {
+        itag = new URL(url).searchParams.get("itag");
+      } catch (_) {}
+    }
+    if (itag) {
+      stream.itag = itag.toString();
+    }
+
+    const idx = currentStreams.findIndex((s) => {
+      if (s.url === url) return true;
+      if (itag && s.itag && s.itag.toString() === itag.toString()) {
+        return true;
+      }
+      return false;
+    });
+
+    if (idx >= 0) {
+      const existing = currentStreams[idx];
+      currentStreams[idx] = {
+        ...existing,
+        ...stream,
+        url: stream.url || existing.url,
+        audioUrl: stream.audioUrl || existing.audioUrl,
+        size: Math.max(existing.size || 0, stream.size || 0),
+        quality: (stream.quality && stream.quality !== "720p HD") ? stream.quality : (existing.quality || stream.quality)
+      };
+    } else {
+      currentStreams.push(stream);
+    }
+
+    window.__ILLUSION_DISCOVERED_STREAMS__ = currentStreams;
+    updateBadge();
+    if (isDropdownOpen) {
+      renderStreamList();
+    }
+  }
+
+  function updateBadge() {
+    if (!barContainer) return;
+    const badge = barContainer.querySelector("#illusion-stream-count");
+    if (badge) {
+      if (currentStreams.length > 1) {
+        badge.style.display = "inline-block";
+        badge.innerText = currentStreams.length.toString();
+      } else {
+        badge.style.display = "none";
+      }
+    }
+  }
+
+  function requestStreamsUpdate() {
+    try {
+      window.dispatchEvent(new CustomEvent("__ILLUSION_TRIGGER_INSPECT__"));
+      document.dispatchEvent(new CustomEvent("__ILLUSION_TRIGGER_INSPECT__"));
+      window.postMessage({ type: "__ILLUSION_TRIGGER_INSPECT__" }, "*");
+    } catch (_) {}
+
+    // Check page window via Firefox Xray Vision wrappedJSObject
+    try {
+      const pageWin = window.wrappedJSObject || window;
+      const pageStreams = pageWin.__ILLUSION_DISCOVERED_STREAMS__;
+      if (pageStreams && Array.isArray(pageStreams)) {
+        pageStreams.forEach((s) => addStream(s));
+      }
+
+      // Direct read ytInitialPlayerResponse or movie_player from page context
+      let pr = null;
+      try {
+        const mp = pageWin.document ? pageWin.document.getElementById("movie_player") : null;
+        if (mp && typeof mp.getPlayerResponse === "function") {
+          pr = mp.getPlayerResponse();
+        }
+      } catch (_) {}
+      if (!pr) {
+        pr = pageWin.ytInitialPlayerResponse;
+      }
+      if (!pr && pageWin.ytplayer && pageWin.ytplayer.config && pageWin.ytplayer.config.args) {
+        try {
+          pr = JSON.parse(pageWin.ytplayer.config.args.raw_player_response || pageWin.ytplayer.config.args.player_response);
+        } catch (_) {}
+      }
+
+      if (pr && pr.streamingData) {
+        const streaming = pr.streamingData;
+        const formats = streaming.formats || [];
+        const adaptive = streaming.adaptiveFormats || [];
+
+        let bestAudio = null;
+        for (const f of adaptive) {
+          if (f.mimeType && f.mimeType.includes("audio")) {
+            let aUrl = f.url;
+            if (!aUrl && (f.signatureCipher || f.cipher)) {
+              try { aUrl = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+            }
+            if (aUrl) {
+              bestAudio = cleanMediaUrl(aUrl);
+              break;
+            }
+          }
+        }
+
+        formats.forEach((f) => {
+          let u = f.url;
+          if (!u && (f.signatureCipher || f.cipher)) {
+            try { u = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+          }
+          if (u) {
+            addStream({
+              url: cleanMediaUrl(u),
+              itag: f.itag ? f.itag.toString() : null,
+              quality: f.qualityLabel || `${f.height || 360}p`,
+              mime: f.mimeType || "video/mp4",
+              size: parseInt(f.contentLength || "0", 10) || 0,
+              audioUrl: null
+            });
+          }
+        });
+
+        adaptive.forEach((f) => {
+          const isAudio = f.mimeType && f.mimeType.includes("audio");
+          let u = f.url;
+          if (!u && (f.signatureCipher || f.cipher)) {
+            try { u = new URLSearchParams(f.signatureCipher || f.cipher).get("url"); } catch (_) {}
+          }
+          if (u) {
+            const qLabel = f.qualityLabel || (isAudio ? (f.bitrate ? `Audio ${(f.bitrate/1000).toFixed(0)}k` : "Audio 128k") : `${f.height || 720}p`);
+            addStream({
+              url: cleanMediaUrl(u),
+              itag: f.itag ? f.itag.toString() : null,
+              quality: qLabel,
+              mime: f.mimeType || (isAudio ? "audio/mp4" : "video/mp4"),
+              size: parseInt(f.contentLength || "0", 10) || 0,
+              audioUrl: isAudio ? null : bestAudio
+            });
+          }
+        });
+      }
+    } catch (_) {}
+
+    const videos = document.querySelectorAll("video");
+    videos.forEach((v) => {
+      const src = v.currentSrc || v.src;
+      if (src && !src.startsWith("blob:") && !src.startsWith("data:") && src.startsWith("http")) {
+        addStream({
+          url: cleanMediaUrl(src),
+          quality: v.videoHeight ? `${v.videoHeight}p` : "Video Stream",
+          mime: src.includes(".m3u8") ? "application/vnd.apple.mpegurl" : "video/mp4",
+          size: 0
+        });
+      }
+    });
+
+    if (typeof chrome !== "undefined" && chrome.runtime?.id) {
+      try {
+        chrome.runtime.sendMessage({ type: "GET_TAB_STREAMS" }, (resp) => {
+          if (!chrome.runtime?.id || chrome.runtime.lastError) return;
+          if (resp && Array.isArray(resp.streams) && resp.streams.length > 0) {
+            resp.streams.forEach((s) => addStream(s));
+          }
+        });
+      } catch (_) {}
+    }
+  }
 
   function initShadowDOM() {
     if (document.getElementById("illusion-ext-root")) {
@@ -257,10 +455,22 @@
       dropdownMenu.classList.remove("visible");
     });
 
-    // Click toggle to show/hide dropdown
+    // Click toggle to show/hide dropdown or trigger instant download
     toggleBtn.addEventListener("click", (e) => {
       if (isDragging) return;
+      if (e.target.closest(".idm-btn-controls")) return;
       e.stopPropagation();
+
+      requestStreamsUpdate();
+
+      const isBadgeClick = e.target.id === "illusion-stream-count";
+
+      // If user clicked the main button (not badge) and we only have 1 stream, download immediately!
+      if (!isBadgeClick && currentStreams.length === 1 && !isDropdownOpen) {
+        triggerDownload(currentStreams[0]);
+        return;
+      }
+
       isDropdownOpen = !isDropdownOpen;
       if (isDropdownOpen) {
         renderStreamList();
@@ -348,11 +558,28 @@
 
     let displayList = currentStreams.slice();
 
-    // Sort streams like IDM: highest quality/size first, audio tracks at bottom
+    function getResolutionRank(quality) {
+      const q = (quality || "").toLowerCase();
+      if (q.includes("2160") || q.includes("4k")) return 2160;
+      if (q.includes("1440") || q.includes("2k")) return 1440;
+      if (q.includes("1080")) return 1080;
+      if (q.includes("720")) return 720;
+      if (q.includes("480")) return 480;
+      if (q.includes("360")) return 360;
+      if (q.includes("240")) return 240;
+      if (q.includes("144")) return 144;
+      return 0;
+    }
+
+    // Sort streams like IDM: resolution descending, file size descending, audio tracks at bottom
     displayList.sort((a, b) => {
-      const aAudio = (a.mime || "").includes("audio");
-      const bAudio = (b.mime || "").includes("audio");
+      const aAudio = (a.mime || "").includes("audio") || (a.quality || "").toLowerCase().includes("audio");
+      const bAudio = (b.mime || "").includes("audio") || (b.quality || "").toLowerCase().includes("audio");
       if (aAudio !== bAudio) return aAudio ? 1 : -1;
+      if (aAudio && bAudio) return (b.size || 0) - (a.size || 0);
+      const aRank = getResolutionRank(a.quality);
+      const bRank = getResolutionRank(b.quality);
+      if (aRank !== bRank) return bRank - aRank;
       return (b.size || 0) - (a.size || 0);
     });
 
@@ -362,8 +589,39 @@
       emptyRow.style.color = "#777";
       emptyRow.style.fontStyle = "italic";
       emptyRow.innerText = "1. Finding media streams (Buffering...)";
+      emptyRow.addEventListener("click", (e) => {
+        e.stopPropagation();
+        requestStreamsUpdate();
+        if (currentStreams.length > 0) {
+          triggerDownload(currentStreams[0]);
+          isDropdownOpen = false;
+          dropdownMenu.classList.remove("visible");
+        } else {
+          showFeedback("Buffering video...");
+        }
+      });
       listContainer.appendChild(emptyRow);
+
+      if (!pollInterval && isDropdownOpen) {
+        let attempts = 0;
+        pollInterval = setInterval(() => {
+          attempts++;
+          requestStreamsUpdate();
+          if (currentStreams.length > 0 || !isDropdownOpen || attempts > 10) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+            if (currentStreams.length > 0 && isDropdownOpen) {
+              renderStreamList();
+            }
+          }
+        }, 300);
+      }
       return;
+    }
+
+    if (pollInterval) {
+      clearInterval(pollInterval);
+      pollInterval = null;
     }
 
     displayList.forEach((stream, index) => {
@@ -392,35 +650,52 @@
 
   function formatMediaLabel(stream, index) {
     const url = stream.url || "";
-    let itag = null;
-    try {
-      itag = new URL(url).searchParams.get("itag");
-    } catch (_) {}
+    let itag = stream.itag || null;
+    if (!itag) {
+      try {
+        itag = new URL(url).searchParams.get("itag");
+      } catch (_) {}
+    }
+
+    let sizeStr = "";
+    if (stream.size && stream.size > 0) {
+      if (stream.size > 1024 * 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`;
+      else if (stream.size > 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024)).toFixed(1)} MB)`;
+      else if (stream.size > 1024) sizeStr = ` (${(stream.size / 1024).toFixed(0)} KB)`;
+    }
 
     if (itag) {
       const itagMap = {
+        "248": "WebM file, quality 1080p",
         "137": "MP4 file, quality 1080p HD",
-        "22": "MP4 file, quality 720p HD",
+        "399": "MP4 file, quality 1080p",
+        "247": "WebM file, quality 720p",
         "136": "MP4 file, quality 720p HD",
+        "398": "MP4 file, quality 720p HD",
+        "303": "WebM file, quality 1080p60 HD",
+        "298": "MP4 file, quality 720p60 HD",
+        "244": "WebM file, quality 480p",
         "135": "MP4 file, quality 480p",
-        "18": "MP4 file, quality 360p",
+        "397": "MP4 file, quality 480p",
+        "243": "WebM file, quality 360p",
         "134": "MP4 file, quality 360p",
-        "140": "M4A file, quality Audio 128k",
-        "251": "WebM file, quality Audio 160k",
-        "250": "WebM file, quality Audio 70k",
-        "249": "WebM file, quality Audio 50k",
+        "396": "MP4 file, quality 360p",
+        "242": "WebM file, quality 240p",
+        "133": "MP4 file, quality 240p",
+        "395": "MP4 file, quality 240p",
+        "278": "WebM file, quality 144p",
+        "160": "MP4 file, quality 144p",
+        "394": "MP4 file, quality 144p",
+        "18": "MP4 file, quality 360p",
+        "22": "MP4 file, quality 720p HD",
         "313": "WebM file, quality 2160p 4K",
         "271": "WebM file, quality 1440p 2K",
-        "303": "WebM file, quality 1080p60 HD",
-        "298": "MP4 file, quality 720p60 HD"
+        "251": "WebM file, quality Audio 160k",
+        "140": "M4A file, quality Audio 128k",
+        "250": "WebM file, quality Audio 70k",
+        "249": "WebM file, quality Audio 50k"
       };
       if (itagMap[itag]) {
-        let sizeStr = "";
-        if (stream.size && stream.size > 0) {
-          if (stream.size > 1024 * 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`;
-          else if (stream.size > 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024)).toFixed(1)} MB)`;
-          else if (stream.size > 1024) sizeStr = ` (${(stream.size / 1024).toFixed(0)} KB)`;
-        }
         return `${index + 1}. ${itagMap[itag]}${sizeStr}`;
       }
     }
@@ -435,12 +710,6 @@
     else if (mime.includes("dash") || url.includes(".mpd")) format = "DASH (.mpd)";
 
     let quality = stream.quality || "720p HD";
-    let sizeStr = "";
-    if (stream.size && stream.size > 0) {
-      if (stream.size > 1024 * 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024 * 1024)).toFixed(1)} GB)`;
-      else if (stream.size > 1024 * 1024) sizeStr = ` (${(stream.size / (1024 * 1024)).toFixed(1)} MB)`;
-      else if (stream.size > 1024) sizeStr = ` (${(stream.size / 1024).toFixed(0)} KB)`;
-    }
     return `${index + 1}. ${format} file, quality ${quality}${sizeStr}`;
   }
 
@@ -480,7 +749,7 @@
 
     let dispatched = false;
 
-    // 1. Try Extension Runtime Message Bus first
+    // 1. Primary Channel: Extension Background Service (enriches with Cookies & Header Ring Buffer)
     if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.id) {
       try {
         const res = await new Promise((resolve) => {
@@ -507,7 +776,7 @@
       }
     }
 
-    // 2. Direct HTTP Bridge Fallback (127.0.0.1:9095) only if extension bus was not connected
+    // 2. Secondary Channel: Direct HTTP Bridge Fallback (only if runtime disconnected)
     if (!dispatched) {
       try {
         const resp = await fetch("http://127.0.0.1:9095/add_download", {
@@ -568,6 +837,20 @@
     }
   });
 
+  // Direct stream discovery listeners from page / main-world hook
+  window.addEventListener("__ILLUSION_STREAM_DISCOVERED__", (e) => {
+    if (e.detail) addStream(e.detail);
+  });
+  document.addEventListener("__ILLUSION_STREAM_DISCOVERED__", (e) => {
+    if (e.detail) addStream(e.detail);
+  });
+  window.addEventListener("message", (e) => {
+    if (e.data && (e.data.type === "__ILLUSION_STREAM_DISCOVERED__" || e.data.type === "ILLUSION_STREAM_DISCOVERED")) {
+      const s = e.data.detail || e.data.stream;
+      if (s) addStream(s);
+    }
+  });
+
   // Listen to background messages
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === "POSITION_BAR" && msg.rect) {
@@ -576,20 +859,7 @@
     }
 
     if (msg.type === "STREAM_REGISTRY_UPDATED" && Array.isArray(msg.streams)) {
-      currentStreams = msg.streams;
-      window.__ILLUSION_DISCOVERED_STREAMS__ = currentStreams;
-      if (barContainer) {
-        const badge = barContainer.querySelector("#illusion-stream-count");
-        if (badge) {
-          if (currentStreams.length > 1) {
-            badge.style.display = "inline-block";
-            badge.innerText = currentStreams.length.toString();
-          } else {
-            badge.style.display = "none";
-          }
-        }
-      }
-      if (isDropdownOpen) renderStreamList();
+      msg.streams.forEach((s) => addStream(s));
     }
   });
 
