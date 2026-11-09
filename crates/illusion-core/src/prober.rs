@@ -297,4 +297,20 @@ mod tests {
         let cd_utf8 = "attachment; filename*=UTF-8''my%20song.mp3";
         assert_eq!(parse_content_disposition_filename(cd_utf8), Some("my song.mp3".to_string()));
     }
+
+    #[test]
+    fn request_headers_keep_context_but_generate_range_separately() {
+        let mut source = HashMap::new();
+        source.insert("Referer".to_string(), "https://example.invalid/watch".to_string());
+        source.insert("Origin".to_string(), "https://example.invalid".to_string());
+        source.insert("Range".to_string(), "bytes=9-".to_string());
+        source.insert("Host".to_string(), "wrong.invalid".to_string());
+
+        let headers = build_request_headers(&source, Some("session=abc"), Some("test-agent"));
+        assert_eq!(headers.get("referer").unwrap(), "https://example.invalid/watch");
+        assert_eq!(headers.get("origin").unwrap(), "https://example.invalid");
+        assert_eq!(headers.get("cookie").unwrap(), "session=abc");
+        assert!(headers.get("range").is_none());
+        assert!(headers.get("host").is_none());
+    }
 }

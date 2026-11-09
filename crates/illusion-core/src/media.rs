@@ -127,4 +127,28 @@ mod tests {
         assert_eq!(headers.get("referer").unwrap(), "https://example.invalid/watch");
         assert_eq!(headers.get("origin").unwrap(), "https://example.invalid");
     }
+
+    #[test]
+    fn paired_size_is_unknown_when_one_track_has_no_observed_size() {
+        let candidate = MediaCandidate {
+            id: None,
+            kind: MediaCandidateKind::PairedAudioVideo,
+            page_url: None,
+            primary: RequestContext {
+                url: "https://example.invalid/video".to_string(),
+                content_length: Some(10),
+                ..RequestContext::default()
+            },
+            audio: Some(RequestContext {
+                url: "https://example.invalid/audio".to_string(),
+                content_length: None,
+                ..RequestContext::default()
+            }),
+            quality: None,
+            codecs: None,
+            unsupported_reason: None,
+        };
+
+        assert_eq!(candidate.expected_size(), None);
+    }
 }
