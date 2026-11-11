@@ -1,16 +1,17 @@
 use crate::prober::{build_request_headers, probe_request};
+use crate::scheduler::{AdaptiveRangeScheduler, StealAction, WorkerSlot};
 use crate::segment::{Segment, SegmentStatus};
 use crate::state::AppState;
 use crate::storage::DiskStorage;
 use crate::task::{DownloadTask, TaskStatus};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
-use reqwest::header::{HeaderValue, RANGE};
+use reqwest::header::{HeaderValue, RANGE, RETRY_AFTER};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -94,6 +95,7 @@ impl DownloadEngine {
             .connect_timeout(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(32)
+            .tcp_nodelay(true)
             .build()
             .unwrap_or_default();
 
@@ -519,7 +521,8 @@ impl DownloadEngine {
         state: AppState,
         cancel_rx: &mut watch::Receiver<bool>,
     ) -> Result<()> {
-        let conn_count = self.max_connections;
+        // Avoid over-splitting small objects into many tiny range requests (Hydra principle)
+        let conn_count = ((total_size / (128 * 1024)).max(1) as usize).min(self.max_connections);
 
         // Initialize segments if not present
         {
@@ -542,182 +545,179 @@ impl DownloadEngine {
             }
         }
 
-        let segments_mutex = Arc::new(Mutex::new({
+        let segs_snapshot = {
             let list = state.tasks.read().unwrap();
             list.iter()
                 .find(|t| t.id == task_id)
                 .map(|t| t.segments.clone())
                 .unwrap_or_default()
-        }));
-
-        let total_downloaded = Arc::new(AtomicU64::new({
-            let list = state.tasks.read().unwrap();
-            list.iter().find(|t| t.id == task_id).map(|t| t.downloaded_size).unwrap_or(0)
-        }));
-
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let (done_tx, mut done_rx) = mpsc::channel::<()>(conn_count * 2);
-
-        // Spawn segment download workers
-        let segs_snapshot = {
-            let l = segments_mutex.lock().await;
-            l.clone()
         };
 
-        for seg in segs_snapshot {
-            if seg.is_finished() {
+        let initial_downloaded: u64 = segs_snapshot.iter().map(|s| s.downloaded_bytes()).sum();
+        let total_downloaded = Arc::new(AtomicU64::new(initial_downloaded));
+
+        let slots: Vec<WorkerSlot> = segs_snapshot
+            .iter()
+            .map(|s| WorkerSlot::new(s.id, s.start, s.current, s.end, 0.0))
+            .collect();
+
+        let max_cap = self.max_connections.max(conn_count);
+        let mut scheduler = AdaptiveRangeScheduler::new(slots, max_cap, 2.0);
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let (event_tx, mut event_rx) = mpsc::channel::<WorkerEvent>(256);
+
+        let mut in_flight: usize = 0;
+        let initial_slots = scheduler.slots.clone();
+        for slot in &initial_slots {
+            if slot.finished {
                 continue;
             }
-
-            let client = self.client.clone();
-            let url = url.to_string();
-            let storage = storage.clone();
-            let segs_ref = segments_mutex.clone();
-            let total_dl = total_downloaded.clone();
-            let stop = stop_flag.clone();
-            let done_tx = done_tx.clone();
-            let headers_map = headers_map.clone();
-            let cookies = cookies.map(|s| s.to_string());
-            let user_agent = user_agent.map(|s| s.to_string());
-            let rate_limiter = self.rate_limiter.clone();
-            let seg_id = seg.id;
-
-            tokio::spawn(async move {
-                let _ = run_segment_worker(
-                    client,
-                    url,
-                    seg_id,
-                    segs_ref,
-                    storage,
-                    total_dl,
-                    stop,
-                    headers_map,
-                    cookies,
-                    user_agent,
-                    rate_limiter,
-                )
-                .await;
-                let _ = done_tx.send(()).await;
-            });
+            in_flight += 1;
+            spawn_slot_worker(
+                self.client.clone(),
+                url.to_string(),
+                slot,
+                storage.clone(),
+                total_downloaded.clone(),
+                stop_flag.clone(),
+                event_tx.clone(),
+                headers_map.clone(),
+                cookies.map(|s| s.to_string()),
+                user_agent.map(|s| s.to_string()),
+                self.rate_limiter.clone(),
+            );
         }
 
-        // Monitoring and dynamic rebalancing loop
-        let mut last_instant = Instant::now();
-        let mut last_bytes = total_downloaded.load(Ordering::Relaxed);
+        let start_instant = Instant::now();
+        let mut last_ui_sync = Instant::now();
+        let mut last_bytes = total_downloaded.load(Ordering::Acquire);
+        let mut tick_interval = tokio::time::interval(Duration::from_millis(100));
+        tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_err: Option<String> = None;
 
-        loop {
+        while in_flight > 0 {
+            if total_downloaded.load(Ordering::Acquire) >= total_size
+                && scheduler.slots.iter().all(|s| s.pos.load(Ordering::Acquire) > s.end.load(Ordering::Acquire))
+            {
+                stop_flag.store(true, Ordering::Release);
+                break;
+            }
             tokio::select! {
-                _ = sleep(Duration::from_millis(500)) => {
+                _ = tick_interval.tick() => {
                     if *cancel_rx.borrow() {
-                        stop_flag.store(true, Ordering::Relaxed);
+                        stop_flag.store(true, Ordering::Release);
                         return Err(anyhow!("Cancelled"));
                     }
 
+                    // Drain batched worker telemetry events non-blockingly
+                    let now_secs = start_instant.elapsed().as_secs_f64();
+                    while let Ok(ev) = event_rx.try_recv() {
+                        match ev {
+                            WorkerEvent::Ttfb { secs, .. } => {
+                                scheduler.observe_ttfb(secs);
+                            }
+                            WorkerEvent::Progress { slot_id, bytes, dt_secs } => {
+                                scheduler.on_bytes(slot_id, bytes, now_secs, dt_secs);
+                            }
+                            WorkerEvent::Refused { retry_after_secs } => {
+                                // Server returned 429/503: lower concurrency ceiling cleanly
+                                let active_now = scheduler.active_count().saturating_sub(1).max(1);
+                                scheduler.max_concurrent = scheduler.max_concurrent.min(active_now);
+                                warn!("Origin refused excess concurrency ({}s backoff); clamped max_concurrent to {}", retry_after_secs, scheduler.max_concurrent);
+                            }
+                            WorkerEvent::Finished { slot_id, err } => {
+                                in_flight = in_flight.saturating_sub(1);
+                                scheduler.mark_finished(slot_id);
+                                if let Some(msg) = err {
+                                    last_err = Some(msg);
+                                }
+                            }
+                        }
+                    }
+
+                    // Run Hydra CUSUM collapse + divergence steal scheduler
+                    let actions = scheduler.tick(now_secs);
+                    for action in actions {
+                        match action {
+                            StealAction::ShrinkAndSpawn { victim_id, new_victim_end, new_id, steal_start, steal_end } => {
+                                if let Some(new_slot) = scheduler.slots.iter().find(|s| s.id == new_id).cloned() {
+                                    info!(
+                                        "Hydra scheduler steal: shrunk worker {} end -> {}, spawning worker {} [{}-{}]",
+                                        victim_id, new_victim_end, new_id, steal_start, steal_end
+                                    );
+                                    in_flight += 1;
+                                    spawn_slot_worker(
+                                        self.client.clone(),
+                                        url.to_string(),
+                                        &new_slot,
+                                        storage.clone(),
+                                        total_downloaded.clone(),
+                                        stop_flag.clone(),
+                                        event_tx.clone(),
+                                        headers_map.clone(),
+                                        cookies.map(|s| s.to_string()),
+                                        user_agent.map(|s| s.to_string()),
+                                        self.rate_limiter.clone(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Sync UI & segment state periodically (every ~250ms, never on hot read loop)
                     let now = Instant::now();
-                    let elapsed = now.duration_since(last_instant).as_secs_f64();
-                    let current_bytes = total_downloaded.load(Ordering::Relaxed);
-                    let delta = current_bytes.saturating_sub(last_bytes);
-                    let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                    if now.duration_since(last_ui_sync) >= Duration::from_millis(250) {
+                        let elapsed = now.duration_since(last_ui_sync).as_secs_f64();
+                        let current_bytes = total_downloaded.load(Ordering::Acquire);
+                        let delta = current_bytes.saturating_sub(last_bytes);
+                        let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
+                        last_ui_sync = now;
+                        last_bytes = current_bytes;
 
-                    last_instant = now;
-                    last_bytes = current_bytes;
+                        let remaining = total_size.saturating_sub(current_bytes);
+                        let eta = if speed > 1024.0 { Some((remaining as f64 / speed) as u64) } else { None };
+                        let segs_view = snapshot_segments_from_slots(&scheduler.slots);
 
-                    let remaining = total_size.saturating_sub(current_bytes);
-                    let eta = if speed > 1024.0 { Some((remaining as f64 / speed) as u64) } else { None };
-
-                    // Update task in state
-                    {
-                        let segs = {
-                            let l = segments_mutex.lock().await;
-                            l.clone()
-                        };
                         let mut list = state.tasks.write().unwrap();
                         if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
                             t.downloaded_size = current_bytes;
                             t.speed = speed;
                             t.eta_seconds = eta;
-                            t.segments = segs;
+                            t.segments = segs_view;
                         }
-                    }
-
-                    // Check if complete
-                    if current_bytes >= total_size {
-                        break;
                     }
                 }
-                _ = done_rx.recv() => {
-                    // An active worker finished. Try dynamic chunk rebalancing (IDM core mechanism!)
-                    let mut segs = segments_mutex.lock().await;
-                    let next_id = segs.len();
-
-                    // Find an active segment with the largest remaining bytes (>= 2MB)
-                    let mut best_idx = None;
-                    let mut max_remaining = 2_000_000; // 2MB min threshold
-
-                    for (idx, s) in segs.iter().enumerate() {
-                        if s.status == SegmentStatus::Downloading {
-                            let rem = s.remaining_bytes();
-                            if rem > max_remaining {
-                                max_remaining = rem;
-                                best_idx = Some(idx);
+                maybe_ev = event_rx.recv() => {
+                    if let Some(ev) = maybe_ev {
+                        let now_secs = start_instant.elapsed().as_secs_f64();
+                        match ev {
+                            WorkerEvent::Ttfb { secs, .. } => scheduler.observe_ttfb(secs),
+                            WorkerEvent::Progress { slot_id, bytes, dt_secs } => {
+                                scheduler.on_bytes(slot_id, bytes, now_secs, dt_secs);
+                            }
+                            WorkerEvent::Refused { .. } => {
+                                let active_now = scheduler.active_count().saturating_sub(1).max(1);
+                                scheduler.max_concurrent = scheduler.max_concurrent.min(active_now);
+                            }
+                            WorkerEvent::Finished { slot_id, err } => {
+                                in_flight = in_flight.saturating_sub(1);
+                                scheduler.mark_finished(slot_id);
+                                if let Some(msg) = err {
+                                    last_err = Some(msg);
+                                }
                             }
                         }
-                    }
-
-                    if let Some(idx) = best_idx {
-                        if let Some(new_seg) = segs[idx].split_remaining(next_id, 1_000_000) {
-                            info!("Dynamic IDM rebalance: Split segment {} into new segment {}", idx, next_id);
-                            segs.push(new_seg.clone());
-                            drop(segs);
-
-                            // Launch worker for the newly split segment
-                            let client = self.client.clone();
-                            let url = url.to_string();
-                            let storage = storage.clone();
-                            let segs_ref = segments_mutex.clone();
-                            let total_dl = total_downloaded.clone();
-                            let stop = stop_flag.clone();
-                            let done_tx = done_tx.clone();
-                            let headers_map = headers_map.clone();
-                            let cookies = cookies.map(|s| s.to_string());
-                            let user_agent = user_agent.map(|s| s.to_string());
-                            let rate_limiter = self.rate_limiter.clone();
-
-                            tokio::spawn(async move {
-                                let _ = run_segment_worker(
-                                    client,
-                                    url,
-                                    new_seg.id,
-                                    segs_ref,
-                                    storage,
-                                    total_dl,
-                                    stop,
-                                    headers_map,
-                                    cookies,
-                                    user_agent,
-                                    rate_limiter,
-                                )
-                                .await;
-                                let _ = done_tx.send(()).await;
-                            });
-                        }
                     } else {
-                        // Check if all finished
-                        let all_done = segs.iter().all(|s| s.is_finished());
-                        if all_done {
-                            break;
-                        }
+                        break;
                     }
                 }
             }
         }
 
-        // Final update to state after all segments finish
-        let final_downloaded = total_downloaded.load(Ordering::Relaxed);
-        let final_segs = {
-            let l = segments_mutex.lock().await;
-            l.clone()
-        };
+        // Final update to state after all workers exit
+        let final_downloaded = total_downloaded.load(Ordering::Acquire);
+        let final_segs = snapshot_segments_from_slots(&scheduler.slots);
         {
             let mut list = state.tasks.write().unwrap();
             if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
@@ -726,6 +726,12 @@ impl DownloadEngine {
                 t.speed = 0.0;
                 t.eta_seconds = None;
             }
+        }
+
+        if final_downloaded < total_size {
+            return Err(anyhow!(
+                last_err.unwrap_or_else(|| format!("Incomplete multisegment transfer ({}/{})", final_downloaded, total_size))
+            ));
         }
 
         Ok(())
@@ -760,35 +766,59 @@ impl DownloadEngine {
         let mut downloaded: u64 = 0;
         let mut last_instant = Instant::now();
         let mut last_bytes: u64 = 0;
+        const WRITE_COALESCE_CAP: usize = 64 * 1024;
+        let mut write_buf = Vec::with_capacity(WRITE_COALESCE_CAP);
+        let mut buf_offset: u64 = 0;
 
         while let Some(chunk_res) = resp.chunk().await? {
             if *cancel_rx.borrow() {
+                if !write_buf.is_empty() {
+                    storage.write_at_slice(buf_offset, &write_buf)?;
+                    write_buf.clear();
+                }
                 return Err(anyhow!("Cancelled"));
             }
 
             let len = chunk_res.len() as u64;
-            storage.write_at(downloaded, chunk_res.to_vec()).await?;
-            downloaded += len;
+            if write_buf.len() + chunk_res.len() > WRITE_COALESCE_CAP && !write_buf.is_empty() {
+                storage.write_at_slice(buf_offset, &write_buf)?;
+                downloaded += write_buf.len() as u64;
+                write_buf.clear();
+                buf_offset = downloaded;
+            }
+            if chunk_res.len() >= WRITE_COALESCE_CAP {
+                storage.write_at_slice(downloaded, &chunk_res)?;
+                downloaded += len;
+                buf_offset = downloaded;
+            } else {
+                if write_buf.is_empty() {
+                    buf_offset = downloaded;
+                }
+                write_buf.extend_from_slice(&chunk_res);
+            }
 
-            // Throttle speed if rate limiter is active
             self.rate_limiter.throttle(len as usize).await;
 
             let now = Instant::now();
             let elapsed = now.duration_since(last_instant).as_secs_f64();
             if elapsed >= 0.5 {
-                let delta = downloaded.saturating_sub(last_bytes);
+                let delta = (downloaded + write_buf.len() as u64).saturating_sub(last_bytes);
                 let speed = if elapsed > 0.0 { delta as f64 / elapsed } else { 0.0 };
                 last_instant = now;
-                last_bytes = downloaded;
+                last_bytes = downloaded + write_buf.len() as u64;
 
-                {
-                    let mut list = state.tasks.write().unwrap();
-                    if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
-                        t.downloaded_size = downloaded;
-                        t.speed = speed;
-                    }
+                let mut list = state.tasks.write().unwrap();
+                if let Some(t) = list.iter_mut().find(|t| t.id == task_id) {
+                    t.downloaded_size = last_bytes;
+                    t.speed = speed;
                 }
             }
+        }
+
+        if !write_buf.is_empty() {
+            storage.write_at_slice(buf_offset, &write_buf)?;
+            downloaded += write_buf.len() as u64;
+            write_buf.clear();
         }
 
         // Always update total downloaded size at end
@@ -807,6 +837,96 @@ impl DownloadEngine {
     }
 }
 
+#[derive(Debug)]
+enum WorkerEvent {
+    Ttfb {
+        #[allow(dead_code)]
+        slot_id: usize,
+        secs: f64,
+    },
+    Progress {
+        slot_id: usize,
+        bytes: u64,
+        dt_secs: f64,
+    },
+    Refused {
+        retry_after_secs: u64,
+    },
+    Finished {
+        slot_id: usize,
+        err: Option<String>,
+    },
+}
+
+fn snapshot_segments_from_slots(slots: &[WorkerSlot]) -> Vec<Segment> {
+    slots
+        .iter()
+        .map(|slot| {
+            let current = slot.pos.load(Ordering::Acquire);
+            let end = slot.end.load(Ordering::Acquire);
+            let status = if current > end || slot.finished {
+                SegmentStatus::Completed
+            } else if slot.active {
+                SegmentStatus::Downloading
+            } else {
+                SegmentStatus::Pending
+            };
+            Segment {
+                id: slot.id,
+                start: slot.start,
+                current,
+                end,
+                status,
+                speed: slot.rate_est,
+            }
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_slot_worker(
+    client: reqwest::Client,
+    url: String,
+    slot: &WorkerSlot,
+    storage: DiskStorage,
+    total_dl: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    event_tx: mpsc::Sender<WorkerEvent>,
+    headers_map: HashMap<String, String>,
+    cookies: Option<String>,
+    user_agent: Option<String>,
+    rate_limiter: RateLimiter,
+) {
+    let slot_id = slot.id;
+    let pos_atomic = slot.pos.clone();
+    let end_atomic = slot.end.clone();
+
+    tokio::spawn(async move {
+        let res = run_segment_worker(
+            client,
+            url,
+            slot_id,
+            pos_atomic,
+            end_atomic,
+            storage,
+            total_dl,
+            stop,
+            event_tx.clone(),
+            headers_map,
+            cookies,
+            user_agent,
+            rate_limiter,
+        )
+        .await;
+        let _ = event_tx
+            .send(WorkerEvent::Finished {
+                slot_id,
+                err: res.err().map(|e| e.to_string()),
+            })
+            .await;
+    });
+}
+
 fn content_range_starts_at(header: Option<&str>, expected_start: u64) -> bool {
     header
         .and_then(|value| value.strip_prefix("bytes "))
@@ -815,74 +935,127 @@ fn content_range_starts_at(header: Option<&str>, expected_start: u64) -> bool {
         == Some(expected_start)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_segment_worker(
     client: reqwest::Client,
     url: String,
     seg_id: usize,
-    segs: Arc<Mutex<Vec<Segment>>>,
+    pos_atomic: Arc<AtomicU64>,
+    end_atomic: Arc<AtomicU64>,
     storage: DiskStorage,
     total_dl: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
+    event_tx: mpsc::Sender<WorkerEvent>,
     headers_map: HashMap<String, String>,
     cookies: Option<String>,
     user_agent: Option<String>,
     rate_limiter: RateLimiter,
 ) -> Result<()> {
-    // Mark segment as downloading
-    let (mut current, mut end) = {
-        let mut list = segs.lock().await;
-        if let Some(s) = list.iter_mut().find(|s| s.id == seg_id) {
-            s.status = SegmentStatus::Downloading;
-            (s.current, s.end)
-        } else {
-            return Ok(());
+    const WRITE_COALESCE_CAP: usize = 64 * 1024;
+    const REPORT_BYTES_THRESHOLD: u64 = 64 * 1024;
+
+    let mut current = pos_atomic.load(Ordering::Acquire);
+    let mut write_buf = Vec::with_capacity(WRITE_COALESCE_CAP);
+    let mut stall_strikes: u32 = 0;
+
+    loop {
+        let iter_start_pos = current;
+        let cur_end = end_atomic.load(Ordering::Acquire);
+        if current > cur_end || stop.load(Ordering::Acquire) {
+            break;
         }
-    };
 
-    let clean_url = url;
-
-    while current <= end && !stop.load(Ordering::Relaxed) {
         let mut req_headers = build_request_headers(&headers_map, cookies.as_deref(), user_agent.as_deref());
-
-        let range_str = format!("bytes={}-{}", current, end);
+        let range_str = format!("bytes={}-{}", current, cur_end);
         req_headers.insert(RANGE, HeaderValue::from_str(&range_str)?);
 
         let mut retry_count = 0;
         let resp = loop {
-            if retry_count >= 3 {
-                return Err(anyhow!("Segment {} failed after 3 attempts", seg_id));
+            if retry_count >= 4 {
+                return Err(anyhow!("Segment {} failed after retries", seg_id));
             }
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Acquire) {
                 return Ok(());
             }
 
-            match client.get(&clean_url).headers(req_headers.clone()).send().await {
+            // Refresh end in case scheduler shrunk us while retrying
+            let latest_end = end_atomic.load(Ordering::Acquire);
+            if current > latest_end {
+                return Ok(());
+            }
+            if latest_end != cur_end {
+                let updated_range = format!("bytes={}-{}", current, latest_end);
+                req_headers.insert(RANGE, HeaderValue::from_str(&updated_range)?);
+            }
+
+            let t0 = Instant::now();
+            match client.get(&url).headers(req_headers.clone()).send().await {
                 Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT
-                    && content_range_starts_at(r.headers().get(reqwest::header::CONTENT_RANGE).and_then(|value| value.to_str().ok()), current) => break r,
+                    && content_range_starts_at(
+                        r.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()),
+                        current,
+                    ) =>
+                {
+                    let _ = event_tx.try_send(WorkerEvent::Ttfb {
+                        slot_id: seg_id,
+                        secs: t0.elapsed().as_secs_f64(),
+                    });
+                    break r;
+                }
                 Ok(r) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
                     return Err(anyhow!("Segment {} returned a mismatched Content-Range", seg_id));
                 }
-                Ok(r) if current == 0 && r.status() == reqwest::StatusCode::OK => break r,
+                Ok(r) if current == 0 && r.status() == reqwest::StatusCode::OK => {
+                    let _ = event_tx.try_send(WorkerEvent::Ttfb {
+                        slot_id: seg_id,
+                        secs: t0.elapsed().as_secs_f64(),
+                    });
+                    break r;
+                }
                 Ok(r) if r.status() == reqwest::StatusCode::OK && current > 0 => {
-                    // Server does not support byte-range slicing (returned 200 OK for sub-range)
                     return Err(anyhow!("Server does not support byte ranges (returned 200 OK)"));
+                }
+                Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || r.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE =>
+                {
+                    let retry_secs = r
+                        .headers()
+                        .get(RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .unwrap_or(2)
+                        .clamp(1, 15);
+                    let _ = event_tx.try_send(WorkerEvent::Refused {
+                        retry_after_secs: retry_secs,
+                    });
+                    retry_count += 1;
+                    sleep(Duration::from_secs(retry_secs)).await;
                 }
                 Ok(r) => {
                     warn!("Segment {} HTTP status {} unexpected for range request", seg_id, r.status());
                     retry_count += 1;
-                    sleep(Duration::from_millis(500)).await;
+                    sleep(Duration::from_millis(400)).await;
                 }
                 Err(e) => {
                     warn!("Segment {} request error: {:#}", seg_id, e);
                     retry_count += 1;
-                    sleep(Duration::from_millis(500)).await;
+                    sleep(Duration::from_millis(400)).await;
                 }
             }
         };
 
         let mut stream = resp.bytes_stream();
-        while let Some(item) = stream.next().await {
-            if stop.load(Ordering::Relaxed) {
+        let mut buf_start = current;
+        let mut acc_report_bytes: u64 = 0;
+        let mut last_report_time = Instant::now();
+
+        while let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(10), stream.next()).await {
+            if stop.load(Ordering::Acquire) {
+                break;
+            }
+
+            let cur_end = end_atomic.load(Ordering::Acquire);
+            if current > cur_end {
                 break;
             }
 
@@ -894,44 +1067,307 @@ async fn run_segment_worker(
                 }
             };
 
-            let remaining = (end - current + 1) as usize;
-            let chunk = if chunk.len() > remaining {
-                chunk.slice(..remaining)
+            let remaining = (cur_end - current + 1) as usize;
+            let slice = if chunk.len() > remaining {
+                &chunk[..remaining]
             } else {
-                chunk
+                &chunk[..]
             };
-            let len = chunk.len() as u64;
-            storage.write_at(current, chunk.to_vec()).await?;
-            current += len;
-            total_dl.fetch_add(len, Ordering::Relaxed);
 
-            // Throttle speed if rate limiter is active
-            rate_limiter.throttle(len as usize).await;
-
-            // Update segment current pointer and get possibly updated end
-            {
-                let mut list = segs.lock().await;
-                if let Some(s) = list.iter_mut().find(|s| s.id == seg_id) {
-                    s.current = current;
-                    end = s.end; // Dynamic split might have shrunk end!
-                }
+            if slice.is_empty() {
+                break;
             }
 
-            if current > end {
+            // Coalesce into reusable 64KB buffer to slash pwrite64 syscall count, flushing
+            // synchronously before advancing atomic counters (`WriteBeforeAccount` invariant).
+            if write_buf.len() + slice.len() > WRITE_COALESCE_CAP && !write_buf.is_empty() {
+                let latest_end = end_atomic.load(Ordering::Acquire);
+                if buf_start <= latest_end {
+                    let allowed = ((latest_end - buf_start + 1) as usize).min(write_buf.len());
+                    storage.write_at_slice(buf_start, &write_buf[..allowed])?;
+                    let flushed = allowed as u64;
+                    pos_atomic.store(buf_start + flushed, Ordering::Release);
+                    total_dl.fetch_add(flushed, Ordering::Relaxed);
+                    acc_report_bytes += flushed;
+                }
+                write_buf.clear();
+                buf_start = current;
+            }
+
+            if slice.len() >= WRITE_COALESCE_CAP {
+                storage.write_at_slice(current, slice)?;
+                let written = slice.len() as u64;
+                current += written;
+                buf_start = current;
+                pos_atomic.store(current, Ordering::Release);
+                total_dl.fetch_add(written, Ordering::Relaxed);
+                acc_report_bytes += written;
+            } else {
+                if write_buf.is_empty() {
+                    buf_start = current;
+                }
+                write_buf.extend_from_slice(slice);
+                current += slice.len() as u64;
+            }
+
+            rate_limiter.throttle(slice.len()).await;
+
+            // Batch channel arrivals (~64KB or 100ms) instead of allocating per TCP frame
+            let dt = last_report_time.elapsed().as_secs_f64();
+            if acc_report_bytes >= REPORT_BYTES_THRESHOLD || (acc_report_bytes > 0 && dt >= 0.1) {
+                let _ = event_tx.try_send(WorkerEvent::Progress {
+                    slot_id: seg_id,
+                    bytes: acc_report_bytes,
+                    dt_secs: dt,
+                });
+                acc_report_bytes = 0;
+                last_report_time = Instant::now();
+            }
+
+            // Re-read end_atomic on every chunk: if shrunk mid-flight, stop reading immediately!
+            let refreshed_end = end_atomic.load(Ordering::Acquire);
+            if current > refreshed_end {
                 break;
             }
         }
-    }
 
-    // Mark completed or pending
-    let mut list = segs.lock().await;
-    if let Some(s) = list.iter_mut().find(|s| s.id == seg_id) {
-        if s.is_finished() {
-            s.status = SegmentStatus::Completed;
+        // Flush any residual coalesced bytes strictly up to `end_atomic`
+        if !write_buf.is_empty() {
+            let latest_end = end_atomic.load(Ordering::Acquire);
+            if buf_start <= latest_end {
+                let allowed = ((latest_end - buf_start + 1) as usize).min(write_buf.len());
+                storage.write_at_slice(buf_start, &write_buf[..allowed])?;
+                let flushed = allowed as u64;
+                current = buf_start + flushed;
+                pos_atomic.store(current, Ordering::Release);
+                total_dl.fetch_add(flushed, Ordering::Relaxed);
+                acc_report_bytes += flushed;
+            }
+            write_buf.clear();
+        }
+
+        if acc_report_bytes > 0 {
+            let _ = event_tx.try_send(WorkerEvent::Progress {
+                slot_id: seg_id,
+                bytes: acc_report_bytes,
+                dt_secs: last_report_time.elapsed().as_secs_f64().max(0.01),
+            });
+        }
+
+        if current > iter_start_pos {
+            stall_strikes = 0;
         } else {
-            s.status = SegmentStatus::Pending;
+            stall_strikes += 1;
+            if stall_strikes >= 4 {
+                return Err(anyhow!("Segment {} stalled repeatedly without progress", seg_id));
+            }
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn engine_multisegment_coalesced_pwrite_matches_sha256() {
+        // Generate 2 MiB deterministic test payload
+        let size = 2 * 1024 * 1024usize;
+        let payload: Arc<Vec<u8>> = Arc::new((0..size).map(|i| (i.wrapping_mul(31) ^ (i >> 5)) as u8).collect());
+        let expected_hash = Sha256::digest(&*payload);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_payload = payload.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let data = server_payload.clone();
+                tokio::spawn(async move {
+                    let mut req_buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = sock.read(&mut req_buf).await else { return };
+                        if n == 0 { return; }
+                        let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                        let is_head = req_str.starts_with("HEAD ");
+                        let range_line = req_str
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                            .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()));
+
+                        if let Some(r_val) = range_line.and_then(|v| v.strip_prefix("bytes=")) {
+                            let (s_str, e_str) = r_val.split_once('-').unwrap_or(("0", ""));
+                            let start: usize = s_str.parse().unwrap_or(0);
+                            let end: usize = if e_str.is_empty() {
+                                data.len() - 1
+                            } else {
+                                e_str.parse::<usize>().unwrap_or(data.len() - 1).min(data.len() - 1)
+                            };
+                            let slice = &data[start..=end];
+                            let hdr = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n",
+                                slice.len(), start, end, data.len()
+                            );
+                            if sock.write_all(hdr.as_bytes()).await.is_err() { return; }
+                            if !is_head && sock.write_all(slice).await.is_err() { return; }
+                        } else {
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n",
+                                data.len()
+                            );
+                            if sock.write_all(hdr.as_bytes()).await.is_err() { return; }
+                            if !is_head && sock.write_all(&data).await.is_err() { return; }
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("illusion_hydra_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let save_path = tmp_dir.join("test_2mb.bin");
+
+        let state = AppState {
+            tasks: Arc::new(std::sync::RwLock::new(Vec::new())),
+            config_dir: tmp_dir.clone(),
+            default_download_dir: tmp_dir.clone(),
+        };
+
+        let task = DownloadTask::new(
+            format!("http://{}/test_2mb.bin", addr),
+            "test_2mb.bin".to_string(),
+            save_path.clone(),
+            None,
+            HashMap::new(),
+            None,
+            None,
+        );
+        let task_id = task.id.clone();
+        state.tasks.write().unwrap().push(task);
+
+        let engine = DownloadEngine::new(8);
+        let (_tx, rx) = watch::channel(false);
+        engine.run_task(task_id.clone(), state.clone(), rx).await.unwrap();
+
+        let disk_bytes = std::fs::read(&save_path).unwrap();
+        assert_eq!(disk_bytes.len(), size);
+        let actual_hash = Sha256::digest(&disk_bytes);
+        assert_eq!(actual_hash, expected_hash);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn engine_rescues_stalled_chunk_via_hydra_steal() {
+        // 1 MiB file across 4 connections where the 1st sub-range request starting at 0 pauses
+        // once halfway, forcing Hydra's silence/CUSUM steal scheduler to spawn a helper slot
+        // and finish well before a stalled socket ever drains.
+        let size = 1024 * 1024usize;
+        let payload: Arc<Vec<u8>> = Arc::new((0..size).map(|i| (i.wrapping_mul(17) ^ (i >> 3)) as u8).collect());
+        let expected_hash = Sha256::digest(&*payload);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stalled_once = Arc::new(AtomicBool::new(false));
+
+        let server_payload = payload.clone();
+        let stalled_flag = stalled_once.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let data = server_payload.clone();
+                let flag = stalled_flag.clone();
+                tokio::spawn(async move {
+                    let mut req_buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = sock.read(&mut req_buf).await else { return };
+                        if n == 0 { return; }
+                        let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                        let is_head = req_str.starts_with("HEAD ");
+                        let range_line = req_str
+                            .lines()
+                            .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+                            .and_then(|l| l.split_once(':').map(|(_, v)| v.trim()));
+
+                        if let Some(r_val) = range_line.and_then(|v| v.strip_prefix("bytes=")) {
+                            let (s_str, e_str) = r_val.split_once('-').unwrap_or(("0", ""));
+                            let start: usize = s_str.parse().unwrap_or(0);
+                            let end: usize = if e_str.is_empty() {
+                                data.len() - 1
+                            } else {
+                                e_str.parse::<usize>().unwrap_or(data.len() - 1).min(data.len() - 1)
+                            };
+                            let slice = &data[start..=end];
+                            let hdr = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n",
+                                slice.len(), start, end, data.len()
+                            );
+                            if sock.write_all(hdr.as_bytes()).await.is_err() { return; }
+                            if !is_head {
+                                // Deliberately stall the very first worker on byte range start == 0
+                                if start == 0 && !flag.swap(true, Ordering::SeqCst) {
+                                    let first_part = slice.len().min(32 * 1024);
+                                    let _ = sock.write_all(&slice[..first_part]).await;
+                                    sleep(Duration::from_secs(3)).await;
+                                    let _ = sock.write_all(&slice[first_part..]).await;
+                                } else if sock.write_all(slice).await.is_err() {
+                                    return;
+                                }
+                            }
+                        } else {
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: keep-alive\r\n\r\n",
+                                data.len()
+                            );
+                            if sock.write_all(hdr.as_bytes()).await.is_err() { return; }
+                            if !is_head && sock.write_all(&data).await.is_err() { return; }
+                        }
+                    }
+                });
+            }
+        });
+
+        let tmp_dir = std::env::temp_dir().join(format!("illusion_rescue_test_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let save_path = tmp_dir.join("rescue_1mb.bin");
+
+        let state = AppState {
+            tasks: Arc::new(std::sync::RwLock::new(Vec::new())),
+            config_dir: tmp_dir.clone(),
+            default_download_dir: tmp_dir.clone(),
+        };
+
+        let task = DownloadTask::new(
+            format!("http://{}/rescue_1mb.bin", addr),
+            "rescue_1mb.bin".to_string(),
+            save_path.clone(),
+            None,
+            HashMap::new(),
+            None,
+            None,
+        );
+        let task_id = task.id.clone();
+        state.tasks.write().unwrap().push(task);
+
+        let engine = DownloadEngine::new(4);
+        let (_tx, rx) = watch::channel(false);
+        engine.run_task(task_id.clone(), state.clone(), rx).await.unwrap();
+
+        let final_segs = state.tasks.read().unwrap()[0].segments.clone();
+        // Because range 0 stalled, Hydra's steal scheduler must have spawned > 4 segments!
+        assert!(final_segs.len() > 4, "Expected steal scheduler to split stalled segment, got {} segments", final_segs.len());
+
+        let disk_bytes = std::fs::read(&save_path).unwrap();
+        assert_eq!(disk_bytes.len(), size);
+        let actual_hash = Sha256::digest(&disk_bytes);
+        assert_eq!(actual_hash, expected_hash);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }

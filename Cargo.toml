@@ -38,3 +38,11 @@ ksni = "0.3.7"
 arboard = "3.4"
 rfd = "0.15"
 open = "5.3"
+
+# Release performance profile modeled after Hydra (`ja7ad/hydra`):
+# full fat LTO + single codegen-unit + O3 for maximum download hot-path throughput.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
