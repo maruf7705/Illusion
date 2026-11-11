@@ -1,4 +1,5 @@
 pub mod engine;
+pub mod innertube;
 pub mod media;
 pub mod muxer;
 pub mod prober;
@@ -11,6 +12,7 @@ pub mod stream_engine;
 pub mod task;
 
 pub use engine::{DownloadEngine, RateLimiter};
+pub use innertube::{extract_video_id, resolve_youtube_media, DecipherOp, Decipherer};
 pub use media::{MediaCandidate, MediaCandidateKind, RequestContext};
 pub use prober::{probe_url, RemoteInfo};
 pub use resolver::{is_video_page_url, resolve_media_url, ResolvedMedia};

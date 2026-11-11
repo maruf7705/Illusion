@@ -358,7 +358,15 @@ async function handleMediaResponse(tabId, details) {
     cleanUrl.endsWith(".aac") ||
     cleanUrl.endsWith(".wav");
 
-  if (!isYouTubePlayback && !isPlaylist && contentLength > 0 && contentLength < 100 * 1024) {
+  const isSocialMediaStream =
+    cleanUrl.includes("fbcdn.net") ||
+    cleanUrl.includes("cdninstagram.com") ||
+    cleanUrl.includes("tiktokcdn.com") ||
+    cleanUrl.includes("byteoversea.com") ||
+    cleanUrl.includes("video.twimg.com") ||
+    cleanUrl.includes("vimeocdn.com");
+
+  if (!isYouTubePlayback && !isPlaylist && !isSocialMediaStream && contentLength > 0 && contentLength < 100 * 1024) {
     return;
   }
 
@@ -396,6 +404,24 @@ async function handleMediaResponse(tabId, details) {
       sizeBytes = 0; // Don't show misleading 1 KB manifest size as video size
     }
 
+    let pairedAudioUrl = null;
+    if (!isAudio) {
+      const existingAudio = streams.find((s) => s.isAudio && s.url !== targetDownloadUrl);
+      if (existingAudio) {
+        pairedAudioUrl = existingAudio.url;
+      }
+    } else {
+      // Audio stream arrived: retroactively pair with existing video streams lacking audio
+      for (const s of streams) {
+        if (!s.isAudio && !s.audioUrl) {
+          s.audioUrl = targetDownloadUrl;
+          if (s.candidate) {
+            s.candidate.audio = requestContext(targetDownloadUrl, tabId, s.candidate.pageUrl || "", {});
+          }
+        }
+      }
+    }
+
     if (!streams.some((s) => s.url === targetDownloadUrl)) {
       const quality = inferQuality(url, contentType, sizeBytes);
       const item = {
@@ -403,13 +429,13 @@ async function handleMediaResponse(tabId, details) {
         mime: contentType || (isYouTubePlayback ? "video/mp4" : "application/octet-stream"),
         size: sizeBytes,
         quality: quality,
-        audioUrl: null,
+        audioUrl: pairedAudioUrl,
         isAudio: isAudio,
         candidate: makeCandidate(tabId, {
           url: targetDownloadUrl,
           mime: contentType,
           quality,
-          audioUrl: null
+          audioUrl: pairedAudioUrl
         }, "", {
           contentType,
           contentLength: sizeBytes || null,

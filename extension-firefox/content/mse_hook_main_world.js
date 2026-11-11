@@ -158,6 +158,137 @@
     };
   }
 
+  function unescapeJsonStr(str) {
+    if (!str || typeof str !== "string") return "";
+    return str.replace(/\\\//g, "/").replace(/\\u0026/g, "&").replace(/\\u002F/g, "/").replace(/&amp;/g, "&");
+  }
+
+  function parseAndEmitMediaFromResponseText(text, reqUrl) {
+    if (!text || typeof text !== "string") return;
+
+    // A. Facebook / Instagram GraphQL & async payloads (matches IDM AVFacebookParser / AVInstagramParser)
+    const fbHdMatch = text.match(/"playable_url_quality_hd"\s*:\s*"([^"]+)"/);
+    const fbSdMatch = text.match(/"playable_url"\s*:\s*"([^"]+)"/);
+    const fbNativeHd = text.match(/"browser_native_hd_url"\s*:\s*"([^"]+)"/);
+    const fbNativeSd = text.match(/"browser_native_sd_url"\s*:\s*"([^"]+)"/);
+
+    if (fbHdMatch || fbNativeHd) {
+      const u = unescapeJsonStr((fbHdMatch || fbNativeHd)[1]);
+      emitMediaDiscovery({
+        url: u,
+        quality: "HD 1080p (Progressive MP4)",
+        mime: "video/mp4",
+        audioUrl: null
+      });
+    } else if (fbSdMatch || fbNativeSd) {
+      const u = unescapeJsonStr((fbSdMatch || fbNativeSd)[1]);
+      emitMediaDiscovery({
+        url: u,
+        quality: "SD 720p (Progressive MP4)",
+        mime: "video/mp4",
+        audioUrl: null
+      });
+    }
+
+    // Instagram video_url
+    const igMatch = text.match(/"video_url"\s*:\s*"([^"]+)"/);
+    if (igMatch) {
+      const u = unescapeJsonStr(igMatch[1]);
+      emitMediaDiscovery({
+        url: u,
+        quality: "Instagram HD Video",
+        mime: "video/mp4",
+        audioUrl: null
+      });
+    }
+
+    // TikTok playAddr
+    const ttPlayMatch = text.match(/"playAddr"\s*:\s*"([^"]+)"/);
+    if (ttPlayMatch) {
+      const u = unescapeJsonStr(ttPlayMatch[1]);
+      emitMediaDiscovery({
+        url: u,
+        quality: "TikTok HD Video",
+        mime: "video/mp4",
+        audioUrl: null
+      });
+    }
+
+    // Twitter video.twimg.com
+    const twMatch = text.match(/(https?:\\\/\\\/video\.twimg\.com\\\/[^"]+?\.mp4[^"]*)/);
+    if (twMatch) {
+      const u = unescapeJsonStr(twMatch[1]);
+      emitMediaDiscovery({
+        url: u,
+        quality: "Twitter/X Video",
+        mime: "video/mp4",
+        audioUrl: null
+      });
+    }
+
+    // YouTube /youtubei/v1/player JSON response
+    if (typeof reqUrl === "string" && reqUrl.includes("youtubei/v1/player")) {
+      try {
+        const json = JSON.parse(text);
+        if (json && json.streamingData) {
+          inspectStreamingData(json.streamingData, reqUrl);
+        }
+      } catch (_) {}
+    }
+  }
+
+  // 3. Monkey-patch window.fetch and XMLHttpRequest to inspect in-flight video requests
+  const origFetch = window.fetch;
+  if (typeof origFetch === "function") {
+    window.fetch = async function () {
+      const resp = await origFetch.apply(this, arguments);
+      try {
+        const reqUrl = typeof arguments[0] === "string" ? arguments[0] : (arguments[0]?.url || "");
+        if (
+          typeof reqUrl === "string" &&
+          (reqUrl.includes("/api/graphql") ||
+           reqUrl.includes("/video_data_async") ||
+           reqUrl.includes("/api/v1/media/") ||
+           reqUrl.includes("/i/api/graphql") ||
+           reqUrl.includes("youtubei/v1/player"))
+        ) {
+          const clone = resp.clone();
+          clone.text().then((text) => {
+            parseAndEmitMediaFromResponseText(text, reqUrl);
+          }).catch(() => {});
+        }
+      } catch (_) {}
+      return resp;
+    };
+  }
+
+  const origXhrOpen = XMLHttpRequest.prototype.open;
+  const origXhrSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    this.__illusion_url = url;
+    return origXhrOpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function () {
+    this.addEventListener("load", function () {
+      try {
+        const reqUrl = this.__illusion_url || "";
+        if (
+          typeof reqUrl === "string" &&
+          (reqUrl.includes("/api/graphql") ||
+           reqUrl.includes("/video_data_async") ||
+           reqUrl.includes("/api/v1/media/") ||
+           reqUrl.includes("/i/api/graphql") ||
+           reqUrl.includes("youtubei/v1/player"))
+        ) {
+          if (typeof this.responseText === "string") {
+            parseAndEmitMediaFromResponseText(this.responseText, reqUrl);
+          }
+        }
+      } catch (_) {}
+    });
+    return origXhrSend.apply(this, arguments);
+  };
+
   function extractFormatUrl(f) {
     if (!f) return null;
     if (f.url) return f.url;

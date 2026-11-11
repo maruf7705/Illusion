@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 use tracing::info;
@@ -36,15 +37,184 @@ pub fn is_media_stream_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     lower.contains("googlevideo.com/videoplayback")
         || lower.contains("fbcdn.net")
+        || lower.contains("cdninstagram.com")
         || lower.contains("tiktokcdn.com")
         || lower.contains("byteoversea.com")
         || lower.contains("vimeocdn.com")
+        || lower.contains("video.twimg.com")
         || lower.contains(".m3u8")
         || lower.contains(".mpd")
         || lower.contains(".mp4")
         || lower.contains(".webm")
         || lower.contains(".mkv")
         || lower.contains(".ts")
+}
+
+fn unescape_json_url(raw: &str) -> String {
+    let mut s = raw.replace("\\/", "/");
+    s = s.replace("\\u0026", "&");
+    s = s.replace("\\u002F", "/");
+    s = s.replace("&amp;", "&");
+    s
+}
+
+fn extract_title_from_html(html: &str, default_title: &str) -> String {
+    if let Some(caps) = html.lines().find_map(|line| {
+        if line.contains("property=\"og:title\"") || line.contains("name=\"twitter:title\"") {
+            let start = line.find("content=\"")?;
+            let rest = &line[start + 9..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        } else {
+            None
+        }
+    }) {
+        caps
+    } else if let Some(start) = html.find("<title>") {
+        let rest = &html[start + 7..];
+        if let Some(end) = rest.find("</title>") {
+            rest[..end].replace(" - YouTube", "").trim().to_string()
+        } else {
+            default_title.to_string()
+        }
+    } else {
+        default_title.to_string()
+    }
+}
+
+pub fn extract_facebook_media(html: &str, _page_url: &str) -> Option<ResolvedMedia> {
+    // IDM AVFacebookParser equivalent:
+    // Look for progressive URLs first (contains muxed audio+video)
+    let re_hd = Regex::new(r#""playable_url_quality_hd"\s*:\s*"([^"]+)""#).ok()?;
+    let re_sd = Regex::new(r#""playable_url"\s*:\s*"([^"]+)""#).ok()?;
+    let re_native_hd = Regex::new(r#""browser_native_hd_url"\s*:\s*"([^"]+)""#).ok()?;
+    let re_native_sd = Regex::new(r#""browser_native_sd_url"\s*:\s*"([^"]+)""#).ok()?;
+    let re_fbcdn = Regex::new(r#"(https?:\\/\\/[^"]+?\.fbcdn\.net\\/[^"]+?\.mp4[^"]*)"#).ok()?;
+
+    let target_url = if let Some(cap) = re_hd.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_native_hd.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_sd.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_native_sd.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_fbcdn.captures(html) {
+        unescape_json_url(&cap[1])
+    } else {
+        return None;
+    };
+
+    let title = extract_title_from_html(html, "facebook_video");
+    let clean_title = crate::prober::sanitize_filename(&title);
+
+    let mut headers = HashMap::new();
+    headers.insert("Referer".to_string(), "https://www.facebook.com/".to_string());
+    headers.insert("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string());
+
+    Some(ResolvedMedia {
+        stream_url: target_url,
+        audio_url: None,
+        filename: format!("{}.mp4", clean_title),
+        title,
+        total_size: None,
+        headers,
+        user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()),
+    })
+}
+
+pub fn extract_instagram_media(html: &str, _page_url: &str) -> Option<ResolvedMedia> {
+    // IDM AVInstagramParser equivalent:
+    let re_video_url = Regex::new(r#""video_url"\s*:\s*"([^"]+)""#).ok()?;
+    let re_video_ver = Regex::new(r#""video_versions"\s*:\s*\[\s*\{[^}]*?"url"\s*:\s*"([^"]+)""#).ok()?;
+    let re_igcdn = Regex::new(r#"(https?:\\/\\/[^"]+?\.cdninstagram\.com\\/[^"]+?\.mp4[^"]*)"#).ok()?;
+
+    let target_url = if let Some(cap) = re_video_url.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_video_ver.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_igcdn.captures(html) {
+        unescape_json_url(&cap[1])
+    } else {
+        return None;
+    };
+
+    let title = extract_title_from_html(html, "instagram_reel");
+    let clean_title = crate::prober::sanitize_filename(&title);
+
+    let mut headers = HashMap::new();
+    headers.insert("Referer".to_string(), "https://www.instagram.com/".to_string());
+    headers.insert("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string());
+
+    Some(ResolvedMedia {
+        stream_url: target_url,
+        audio_url: None,
+        filename: format!("{}.mp4", clean_title),
+        title,
+        total_size: None,
+        headers,
+        user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()),
+    })
+}
+
+pub fn extract_tiktok_media(html: &str, _page_url: &str) -> Option<ResolvedMedia> {
+    let re_play_addr = Regex::new(r#""playAddr"\s*:\s*"([^"]+)""#).ok()?;
+    let re_download_addr = Regex::new(r#""downloadAddr"\s*:\s*"([^"]+)""#).ok()?;
+    let re_ttcdn = Regex::new(r#"(https?:\\/\\/[^"]+?(?:tiktokcdn|byteoversea)\.com\\/[^"]+?\.mp4[^"]*)"#).ok()?;
+
+    let target_url = if let Some(cap) = re_play_addr.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_download_addr.captures(html) {
+        unescape_json_url(&cap[1])
+    } else if let Some(cap) = re_ttcdn.captures(html) {
+        unescape_json_url(&cap[1])
+    } else {
+        return None;
+    };
+
+    let title = extract_title_from_html(html, "tiktok_video");
+    let clean_title = crate::prober::sanitize_filename(&title);
+
+    let mut headers = HashMap::new();
+    headers.insert("Referer".to_string(), "https://www.tiktok.com/".to_string());
+    headers.insert("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string());
+
+    Some(ResolvedMedia {
+        stream_url: target_url,
+        audio_url: None,
+        filename: format!("{}.mp4", clean_title),
+        title,
+        total_size: None,
+        headers,
+        user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()),
+    })
+}
+
+pub fn extract_twitter_media(html: &str, _page_url: &str) -> Option<ResolvedMedia> {
+    let re_twimg = Regex::new(r#"(https?://video\.twimg\.com/[^"]+?\.mp4(?:[?][^"]*)?)"#).ok()?;
+
+    let target_url = if let Some(cap) = re_twimg.captures(html) {
+        cap[1].to_string()
+    } else {
+        return None;
+    };
+
+    let title = extract_title_from_html(html, "twitter_video");
+    let clean_title = crate::prober::sanitize_filename(&title);
+
+    let mut headers = HashMap::new();
+    headers.insert("Referer".to_string(), "https://x.com/".to_string());
+    headers.insert("User-Agent".to_string(), "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".to_string());
+
+    Some(ResolvedMedia {
+        stream_url: target_url,
+        audio_url: None,
+        filename: format!("{}.mp4", clean_title),
+        title,
+        total_size: None,
+        headers,
+        user_agent: Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64)".to_string()),
+    })
 }
 
 pub async fn resolve_media_url(
@@ -91,29 +261,47 @@ pub async fn resolve_media_url(
         });
     }
 
-    // 2. Fetch HTML page to inspect OpenGraph tags, HTML5 video tags, or embedded metadata
+    // 2. If it is a YouTube watch URL, resolve natively via pure Rust InnerTube & base.js decipherer
+    if page_url.contains("youtube.com") || page_url.contains("youtu.be") {
+        match crate::innertube::resolve_youtube_media(page_url).await {
+            Ok(media) => return Ok(media),
+            Err(e) => {
+                tracing::warn!("Native InnerTube resolver encountered issue: {}. Falling back to OpenGraph page parsing.", e);
+            }
+        }
+    }
+
+    // 3. Fetch HTML page to inspect OpenGraph tags, HTML5 video tags, or embedded Relay/GraphQL metadata
     let resp = client.get(page_url).send().await?;
     let html = resp.text().await?;
 
-    // Extract title from og:title or <title>
-    let mut title = "video".to_string();
-    if let Some(caps) = html.lines().find_map(|line| {
-        if line.contains("property=\"og:title\"") || line.contains("name=\"twitter:title\"") {
-            let start = line.find("content=\"")?;
-            let rest = &line[start + 9..];
-            let end = rest.find('"')?;
-            Some(rest[..end].to_string())
-        } else {
-            None
-        }
-    }) {
-        title = caps;
-    } else if let Some(start) = html.find("<title>") {
-        let rest = &html[start + 7..];
-        if let Some(end) = rest.find("</title>") {
-            title = rest[..end].replace(" - YouTube", "").trim().to_string();
+    // 4. Try specialized social media parsers (equivalent to IDM AVFacebookParser, AVInstagramParser, etc.)
+    if page_url.contains("facebook.com") || page_url.contains("fb.watch") {
+        if let Some(media) = extract_facebook_media(&html, page_url) {
+            return Ok(media);
         }
     }
+
+    if page_url.contains("instagram.com") {
+        if let Some(media) = extract_instagram_media(&html, page_url) {
+            return Ok(media);
+        }
+    }
+
+    if page_url.contains("tiktok.com") {
+        if let Some(media) = extract_tiktok_media(&html, page_url) {
+            return Ok(media);
+        }
+    }
+
+    if page_url.contains("twitter.com") || page_url.contains("x.com") {
+        if let Some(media) = extract_twitter_media(&html, page_url) {
+            return Ok(media);
+        }
+    }
+
+    // Extract title from og:title or <title>
+    let title = extract_title_from_html(&html, "video");
 
     // Check OpenGraph video stream URL
     let mut stream_url: Option<String> = None;
@@ -136,16 +324,13 @@ pub async fn resolve_media_url(
         }
     }
 
-    // Check YouTube ytInitialPlayerResponse in pure Rust
+    // Check YouTube ytInitialPlayerResponse in pure Rust fallback
     if stream_url.is_none() && (page_url.contains("youtube.com") || page_url.contains("youtu.be")) {
         if let Some(start) = html.find("ytInitialPlayerResponse = {") {
             let rest = &html[start + 26..];
             if let Some(end) = rest.find("};") {
                 let json_slice = &rest[..=end];
                 if let Ok(v) = serde_json::from_str::<Value>(json_slice) {
-                    if let Some(t) = v.pointer("/videoDetails/title").and_then(|s| s.as_str()) {
-                        title = t.to_string();
-                    }
                     if let Some(fmts) = v.pointer("/streamingData/formats").and_then(|f| f.as_array()) {
                         for fmt in fmts {
                             if let Some(u) = fmt.get("url").and_then(|u| u.as_str()) {
@@ -160,7 +345,7 @@ pub async fn resolve_media_url(
     }
 
     if let Some(url) = stream_url {
-        let clean_title = title.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_");
+        let clean_title = crate::prober::sanitize_filename(&title);
         let ext = if url.contains(".m3u8") { "mp4" } else { "mp4" };
         let filename = format!("{}.{}", clean_title.trim_matches('_'), ext);
 
@@ -185,4 +370,71 @@ pub async fn resolve_media_url(
          Illusion will intercept the live authenticated video stream, cookies, and tokens, and download natively with 8 connections.",
         page_url
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_facebook_media() {
+        let html_mock = r#"
+        <html>
+        <head><title>Viral Cat Video - Facebook</title></head>
+        <body>
+        <script>
+        {"videoData":[{"playable_url_quality_hd":"https:\/\/video.xx.fbcdn.net\/v\/t42.1797-2\/1000_hd.mp4?_nc_cat=101\u0026efg=eyJ2ZW5jb2RlX3RhZyI6ImRhc2hfaGQifQ"}]}
+        </script>
+        </body></html>
+        "#;
+        let res = extract_facebook_media(html_mock, "https://www.facebook.com/reel/123456").unwrap();
+        assert!(res.stream_url.starts_with("https://video.xx.fbcdn.net/v/t42.1797-2/1000_hd.mp4?_nc_cat=101&efg="));
+        assert_eq!(res.title, "Viral Cat Video - Facebook");
+    }
+
+    #[test]
+    fn test_extract_instagram_media() {
+        let html_mock = r#"
+        <html>
+        <head><meta property="og:title" content="Nature Reel on Instagram"></head>
+        <body>
+        <script>
+        {"entry_data":{"PostPage":[{"graphql":{"shortcode_media":{"video_url":"https:\/\/scontent.cdninstagram.com\/v\/t50.2886-16\/300_n.mp4?_nc_ht=scontent.cdninstagram.com\u0026_nc_cat=105"}}}]}}
+        </script>
+        </body></html>
+        "#;
+        let res = extract_instagram_media(html_mock, "https://www.instagram.com/reel/abcdef/").unwrap();
+        assert!(res.stream_url.starts_with("https://scontent.cdninstagram.com/v/t50.2886-16/300_n.mp4?_nc_ht="));
+        assert_eq!(res.title, "Nature Reel on Instagram");
+    }
+
+    #[test]
+    fn test_extract_tiktok_media() {
+        let html_mock = r#"
+        <html>
+        <head><title>Funny Dance | TikTok</title></head>
+        <body>
+        <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">
+        {"__DEFAULT_SCOPE__":{"webapp.video-detail":{"itemInfo":{"itemStruct":{"video":{"playAddr":"https:\/\/v16-webapp-prime.tiktokcdn.com\/video\/tos\/alisg\/tos-alisg-pve-0037c001\/abc.mp4?a=1988\u0026bti=ODszNWYuMDEj"}}}}}
+        </script>
+        </body></html>
+        "#;
+        let res = extract_tiktok_media(html_mock, "https://www.tiktok.com/@user/video/12345").unwrap();
+        assert!(res.stream_url.starts_with("https://v16-webapp-prime.tiktokcdn.com/video/tos/alisg/tos-alisg-pve-0037c001/abc.mp4?a=1988&bti="));
+        assert_eq!(res.title, "Funny Dance | TikTok");
+    }
+
+    #[test]
+    fn test_extract_twitter_media() {
+        let html_mock = r#"
+        <html>
+        <head><meta name="twitter:title" content="Breaking News clip"></head>
+        <body>
+        <a href="https://video.twimg.com/ext_tw_video/123456789/pu/vid/1280x720/vid.mp4?tag=12">Video</a>
+        </body></html>
+        "#;
+        let res = extract_twitter_media(html_mock, "https://x.com/user/status/123456789").unwrap();
+        assert_eq!(res.stream_url, "https://video.twimg.com/ext_tw_video/123456789/pu/vid/1280x720/vid.mp4?tag=12");
+        assert_eq!(res.title, "Breaking News clip");
+    }
 }
