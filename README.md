@@ -25,7 +25,7 @@ Illusion replaces proprietary Windows download accelerators on Linux with a lock
 
 <div align="center">
 
-![Illusion Features](assets/illusion-showcase.png)
+![Illusion Features](assets/illusion-showcase.jpg)
 
 </div>
 
